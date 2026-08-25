@@ -286,15 +286,16 @@ const SEGS=['HAB','SOC','INFR','MIX','MIN','OTRO'];
 const TIPOS=['Constructora','Inmobiliaria','Inmobiliaria-Constructora','Contratista especialista','Distribuidor / abastecimiento','Revendedor / comercializador','Otro'];
 const ROLES=['Decide','Influye','Ejecuta'];
 const MOTIVOS=['Precio','Plazo de entrega','Especificación técnica','Competidor directo','Obra suspendida o postergada','Nunca respondieron','Otro'];
+const EST_PROY=['En estudio','Activo','Suspendido','Cerrado','Perdido'];
 const FAMILIAS=['Malla electrosoldada','Barra / fierro','Alambre','Perfilería steel framing','Cerco Acmanet','Flete','Otro'];
 const VIVA=c=>!['Adjudicada','Perdida','Reemplazada'].includes(c.estado);
 
 const TABS=[['hoy','Hoy'],['tareas','Tareas'],['dash','Dashboard'],['malla','Cartera'],['pipeline','Pipeline'],
-  ['cuentas','Cuentas'],['cotizaciones','Cotizaciones'],['contactos','Personas'],['salud','Salud del dato']];
+  ['cuentas','Cuentas'],['proyectos','Proyectos'],['cotizaciones','Cotizaciones'],['cotizador','Cotizador'],['contactos','Personas'],['salud','Salud del dato']];
 const VIEWS={};
 
 let S=null, saveT=null, UNDO=[], UI={tab:'hoy',q:'',sortC:{key:'venc',dir:1},sortA:{key:'urg',dir:1},
-  fA:{prio:'',canal:'',seg:'',txt:'',arch:false}, fQ:{estado:'',txt:''}, sel:new Set(), open:null, dtab:'ficha'};
+  fA:{prio:'',canal:'',seg:'',txt:'',arch:false}, fQ:{estado:'',txt:''}, sel:new Set(), open:null, dtab:'ficha', openProy:null, openCot:null};
 
 /* ============ carpeta ============ */
 const F_JSON='cartera.json', F_XLSX='respaldo_cartera.xlsx';
@@ -331,6 +332,10 @@ const cuenta=n=>S.cuentas.find(c=>c.nombre===n);
 const cotsDe=n=>S.cotizaciones.filter(q=>q.cuenta===n);
 const contactosDe=n=>S.contactos.filter(c=>c.cuenta===n);
 const tareasDe=n=>S.tareas.filter(t=>t.cuenta===n);
+const proyectosDe=n=>S.proyectos.filter(p=>p.cuenta===n);
+const proyecto=pid=>S.proyectos.find(p=>p.pid===pid);
+const cotsDeProy=pid=>S.cotizaciones.filter(q=>q.proyecto===pid);
+const folioRev=q=>q.folio+(q.rev?' r'+q.rev:'');
 const bitaDe=n=>S.bitacora.filter(b=>b.cuenta===n).sort((a,b)=>(b.ts||'').localeCompare(a.ts||''));
 const abiertas=n=>tareasDe(n).filter(t=>!t.hecha);
 function proxTarea(n){ return abiertas(n).slice().sort((a,b)=>(a.fecha||'9999').localeCompare(b.fecha||'9999'))[0]||null; }
@@ -365,8 +370,9 @@ const activas=()=>S.cuentas.filter(c=>!c.archivada);
 
 /* migración v1 → v2 */
 function migrar(st){
-  st.version=2;
+  st.version=3;
   st.tareas=st.tareas||[];
+  st.proyectos=st.proyectos||[];
   st.cuentas=st.cuentas||[];
   st.cuentas.forEach(c=>{
     if(!c.cid)c.cid=uid();
@@ -378,6 +384,17 @@ function migrar(st){
     if(q.probManual===undefined)q.probManual=(q.prob!==null&&q.prob!==undefined);
     if(q.cierre===undefined)q.cierre=''; if(q.motivoPerdida===undefined)q.motivoPerdida=''; if(q.kg===undefined)q.kg=null; });
   (st.contactos||[]).forEach(p=>{ if(!p.pid)p.pid=uid(); });
+  /* cada cotización cuelga de un proyecto; si no lo tiene, se deriva del campo Obra */
+  (st.cotizaciones||[]).forEach(q=>{
+    if(q.rev===undefined)q.rev=0;
+    if(!q.versiones)q.versiones=[];
+    if(q.proyecto&&st.proyectos.some(p=>p.pid===q.proyecto))return;
+    const nom=(q.obra||'Obra sin definir').trim();
+    let p=st.proyectos.find(x=>x.cuenta===q.cuenta&&norm(x.nombre)===norm(nom));
+    if(!p){ p={pid:uid(),cuenta:q.cuenta,nombre:nom,comuna:'',direccion:'',mandante:'',
+      estado:'Activo',inicio:'',notas:''}; st.proyectos.push(p); }
+    q.proyecto=p.pid;
+  });
   (st.bitacora||[]).forEach(b=>{ if(!b.id)b.id=uid(); });
   return st;
 }
@@ -494,7 +511,7 @@ async function reemitir(q){
   if(!r||!r.folio)return;
   mut('reemitir',()=>{
     const c2={...JSON.parse(JSON.stringify(q)),qid:uid(),folio:r.folio,fecha:iso(HOY),validez:r.val,
-      neto:r.neto===''?0:Number(r.neto),estado:'Enviada',probManual:false,prob:null,oc:'',motivoPerdida:'',cierre:'',nota:'Reemite '+q.folio+'.'};
+      neto:r.neto===''?0:Number(r.neto),estado:'Enviada',probManual:false,prob:null,oc:'',motivoPerdida:'',cierre:'',rev:0,versiones:[],nota:'Reemite '+q.folio+'.'};
     q.estado='Reemplazada'; q.probManual=false; S.cotizaciones.unshift(c2);
     logB(q.cuenta,'cotizacion','Reemitida '+q.folio+' → '+r.folio);
     nuevaTarea(q.cuenta,'Enviar '+r.folio+' al cliente',iso(HOY),'mio',r.folio);
@@ -537,24 +554,76 @@ async function crearCuenta(){
   });
   toast('Cuenta creada');
 }
-async function crearCotizacion(cn){
+async function crearCotizacion(cn,pid){
+  const p0=pid?proyecto(pid):null;
+  const cn2=p0?p0.cuenta:(cn||activas()[0]?.nombre);
+  const proys=proyectosDe(cn2);
   const r=await ask('Nueva cotización',[
-    {k:'cuenta',label:'Cuenta',type:'select',options:activas().map(c=>c.nombre),value:cn||activas()[0]?.nombre},
+    {k:'cuenta',label:'Cuenta',type:'select',options:activas().map(c=>c.nombre),value:cn2},
+    {k:'proyecto',label:'Proyecto',type:'select',options:['— crear proyecto nuevo —',...proys.map(p=>p.nombre)],
+      value:p0?p0.nombre:(proys[0]?.nombre||'— crear proyecto nuevo —')},
     {k:'folio',label:'Folio',value:siguienteFolio()},
-    {k:'obra',label:'Obra o alcance'},
+    {k:'alcance',label:'Alcance de esta oferta',ph:'ej. malla de losas torres A y B'},
     {k:'validez',label:'Válida hasta',type:'date',value:iso(new Date(HOY.getTime()+15*864e5))},
     {k:'estado',label:'Etapa',type:'select',options:ETAPAS,value:'Por enviar'}],'Crear');
   if(!r||!r.folio.trim())return;
+  let pr=S.proyectos.find(p=>p.cuenta===r.cuenta&&p.nombre===r.proyecto);
+  if(!pr){ pr=await crearProyecto(r.cuenta); if(!pr)return; }
   mut('crear cotización',()=>{
     const c=cuenta(r.cuenta);
-    const q={qid:uid(),folio:r.folio.trim(),fecha:iso(HOY),cuenta:r.cuenta,obra:r.obra,contacto:c?.contacto||'',
-      email:c?.email||'',producto:'',neto:0,kg:null,validez:r.validez,estado:r.estado,prob:null,probManual:false,
-      oc:'',nota:'',cierre:'',motivoPerdida:'',lineas:[]};
+    const q={qid:uid(),folio:r.folio.trim(),rev:0,versiones:[],fecha:iso(HOY),cuenta:r.cuenta,proyecto:pr.pid,
+      obra:r.alcance||pr.nombre,contacto:c?.contacto||'',email:c?.email||'',producto:'',neto:0,kg:null,
+      validez:r.validez,estado:r.estado,prob:null,probManual:false,oc:'',nota:'',cierre:'',motivoPerdida:'',lineas:[]};
     S.cotizaciones.unshift(q);
-    logB(r.cuenta,'cotizacion','Creada '+q.folio+' — '+r.obra);
-    UI.open=r.cuenta; UI.dtab='cots';
+    logB(r.cuenta,'cotizacion','Creada '+q.folio+' — '+pr.nombre+(r.alcance?' / '+r.alcance:''));
+    UI.open=r.cuenta; UI.dtab='proy'; UI.openProy=pr.pid;
   });
   toast('Cotización creada. Cárgale las líneas de producto.');
+}
+async function crearProyecto(cn){
+  const r=await ask('Nuevo proyecto',[
+    {k:'cuenta',label:'Cuenta',type:'select',options:activas().map(x=>x.nombre),value:cn||activas()[0]?.nombre},
+    {k:'nombre',label:'Nombre de la obra'},
+    {k:'comuna',label:'Comuna'},
+    {k:'direccion',label:'Dirección'},
+    {k:'mandante',label:'Mandante o unidad de negocio'},
+    {k:'estado',label:'Estado',type:'select',options:EST_PROY,value:'En estudio'}],'Crear proyecto');
+  if(!r||!r.nombre.trim())return null;
+  let nuevo=null;
+  mut('crear proyecto',()=>{
+    nuevo={pid:uid(),cuenta:r.cuenta,nombre:r.nombre.trim(),comuna:r.comuna,direccion:r.direccion,
+      mandante:r.mandante,estado:r.estado,inicio:'',notas:''};
+    S.proyectos.push(nuevo);
+    logB(r.cuenta,'nota','Nuevo proyecto: '+nuevo.nombre);
+    UI.open=r.cuenta; UI.dtab='proy'; UI.openProy=nuevo.pid;
+  });
+  toast('Proyecto creado');
+  return nuevo;
+}
+async function nuevaRevision(q){
+  const r=await ask('Nueva revisión de '+folioRev(q),[
+    {k:'motivo',label:'Qué cambia respecto de la anterior',type:'textarea',ph:'ej. bajó el alcance de 75 a 62,5 ml'},
+    {k:'val',label:'Nueva validez',type:'date',value:iso(new Date(HOY.getTime()+15*864e5))}],'Crear r'+((q.rev||0)+1));
+  if(!r)return;
+  mut('nueva revisión',()=>{
+    q.versiones=q.versiones||[];
+    q.versiones.unshift({rev:q.rev||0,ts:iso(HOY),fecha:q.fecha,neto:q.neto,kg:q.kg,validez:q.validez,
+      estado:q.estado,lineas:JSON.parse(JSON.stringify(q.lineas||[])),nota:q.nota,motivo:r.motivo});
+    q.rev=(q.rev||0)+1; q.validez=r.val; q.fecha=iso(HOY); q.estado='Por enviar'; q.probManual=false; q.prob=null;
+    logB(q.cuenta,'cotizacion','['+q.folio+'] revisión r'+q.rev+': '+r.motivo);
+    nuevaTarea(q.cuenta,'Enviar '+q.folio+' r'+q.rev+' al cliente',iso(HOY),'mio',q.folio);
+  });
+  toast('Revisión r'+q.rev+' creada, con tarea de envío');
+}
+async function restaurarVersion(q,v){
+  if(!await confirmar('Volver a la revisión r'+v.rev+' de '+q.folio+'. La versión actual queda guardada como revisión.','Restaurar'))return;
+  mut('restaurar revisión',()=>{
+    q.versiones.unshift({rev:q.rev,ts:iso(HOY),fecha:q.fecha,neto:q.neto,kg:q.kg,validez:q.validez,estado:q.estado,
+      lineas:JSON.parse(JSON.stringify(q.lineas||[])),nota:q.nota,motivo:'reemplazada al restaurar r'+v.rev});
+    q.neto=v.neto;q.kg=v.kg;q.validez=v.validez;q.estado=v.estado;q.nota=v.nota;
+    q.lineas=JSON.parse(JSON.stringify(v.lineas||[]));q.fecha=v.fecha||q.fecha;
+    logB(q.cuenta,'cotizacion','['+q.folio+'] restaurada la revisión r'+v.rev);
+  });
 }
 async function crearContacto(cn){
   const r=await ask('Nueva persona',[
@@ -571,13 +640,20 @@ async function crearContacto(cn){
   toast('Persona agregada');
 }
 async function borrar(tipo,obj){
-  const nombres={cuenta:obj.nombre,cotizacion:obj.folio,contacto:obj.nombre,tarea:obj.texto,nota:'este registro'};
-  if(!await confirmar('Borrar '+tipo+' «'+String(nombres[tipo]).slice(0,60)+'». Se puede deshacer con Ctrl+Z.','Borrar'))return;
+  const nombres={cuenta:obj.nombre,proyecto:obj.nombre,cotizacion:obj.folio,contacto:obj.nombre,tarea:obj.texto,nota:'este registro'};
+  let extra='';
+  if(tipo==='proyecto'){ const n=cotsDeProy(obj.pid).length;
+    extra=n?' Se van también sus '+n+(n===1?' cotización.':' cotizaciones.'):' No tiene cotizaciones.'; }
+  if(tipo==='cuenta'){ extra=' Se van sus proyectos, cotizaciones, personas y tareas.'; }
+  if(!await confirmar('Borrar '+tipo+' «'+String(nombres[tipo]).slice(0,60)+'».'+extra+' Se puede deshacer con Ctrl+Z.','Borrar'))return;
   mut('borrar '+tipo,()=>{
     if(tipo==='cuenta'){ S.cuentas=S.cuentas.filter(x=>x!==obj);
       S.cotizaciones=S.cotizaciones.filter(x=>x.cuenta!==obj.nombre);
       S.contactos=S.contactos.filter(x=>x.cuenta!==obj.nombre);
-      S.tareas=S.tareas.filter(x=>x.cuenta!==obj.nombre); UI.open=null; }
+      S.tareas=S.tareas.filter(x=>x.cuenta!==obj.nombre);
+      S.proyectos=S.proyectos.filter(x=>x.cuenta!==obj.nombre); UI.open=null; }
+    if(tipo==='proyecto'){ S.cotizaciones=S.cotizaciones.filter(x=>x.proyecto!==obj.pid);
+      S.proyectos=S.proyectos.filter(x=>x!==obj); UI.openProy=null; }
     if(tipo==='cotizacion')S.cotizaciones=S.cotizaciones.filter(x=>x!==obj);
     if(tipo==='contacto')S.contactos=S.contactos.filter(x=>x!==obj);
     if(tipo==='tarea')S.tareas=S.tareas.filter(x=>x!==obj);
@@ -591,6 +667,7 @@ function renombrarCuenta(c,nuevo){
   S.cotizaciones.forEach(q=>{if(q.cuenta===viejo)q.cuenta=nuevo;});
   S.contactos.forEach(p=>{if(p.cuenta===viejo)p.cuenta=nuevo;});
   S.tareas.forEach(t=>{if(t.cuenta===viejo)t.cuenta=nuevo;});
+  S.proyectos.forEach(p=>{if(p.cuenta===viejo)p.cuenta=nuevo;});
   S.bitacora.forEach(b=>{if(b.cuenta===viejo)b.cuenta=nuevo;});
   if(UI.open===viejo)UI.open=nuevo;
 }
@@ -614,7 +691,7 @@ function importarLibro(buf){
   if(typeof XLSX==='undefined')throw new Error('No se pudo cargar el lector de Excel. Revisa la conexión y recarga.');
   const wb=XLSX.read(new Uint8Array(buf),{type:'array',cellDates:true});
   const hoja=n=>{const k=Object.keys(wb.Sheets).find(x=>norm(x)===norm(n));return k?XLSX.utils.sheet_to_json(wb.Sheets[k],{header:1,blankrows:true,defval:null}):null;};
-  const CU=hoja('CUENTAS'),CO=hoja('COTIZACIONES'),CT=hoja('CONTACTOS'),TA=hoja('TAREAS');
+  const CU=hoja('CUENTAS'),CO=hoja('COTIZACIONES'),CT=hoja('CONTACTOS'),TA=hoja('TAREAS'),PR=hoja('PROYECTOS'),LI=hoja('LINEAS');
   if(!CU||!CO)throw new Error('El archivo no tiene las hojas CUENTAS y COTIZACIONES.');
   const hc=hdrRow(CU,['Cuenta','Email']); if(hc<0)throw new Error('No encontré la fila de títulos en CUENTAS.');
   const H=CU[hc],g=(...n)=>colIdx(H,...n);
@@ -636,7 +713,8 @@ function importarLibro(buf){
   const mq={folio:g2('Folio'),fecha:g2('Fecha emisión'),cuenta:g2('Cuenta'),obra:g2('Obra / alcance','Obra'),
     contacto:g2('Contacto'),email:g2('Email'),producto:g2('Producto'),neto:g2('Total neto','Neto'),
     validez:g2('Validez hasta','Validez'),estado:g2('ESTADO','Estado'),prob:g2('Prob.','Prob'),oc:g2('N° OC','OC'),
-    nota:g2('Qué falta / nota','Nota'),kg:g2('kg','Kilos'),cierre:g2('Cierre est.'),motivo:g2('Motivo pérdida')};
+    nota:g2('Qué falta / nota','Nota'),kg:g2('kg','Kilos'),cierre:g2('Cierre est.'),motivo:g2('Motivo pérdida'),
+    proy:g2('Proyecto'),rev:g2('Rev')};
   const cots=[];
   for(let i=hq+1;i<CO.length;i++){const r=CO[i]||[];const f=celTxt(r[mq.folio]),cn=celTxt(r[mq.cuenta]);if(!f||!cn)continue;
     const p=mq.prob>=0?r[mq.prob]:null;
@@ -645,7 +723,8 @@ function importarLibro(buf){
       estado:celTxt(r[mq.estado])||'Enviada',prob:(p===null||p===undefined||p==='')?null:Number(p),
       probManual:!(p===null||p===undefined||p===''),oc:celTxt(r[mq.oc]),nota:celTxt(r[mq.nota]),
       kg:mq.kg>=0&&celNum(r[mq.kg])?celNum(r[mq.kg]):null,cierre:mq.cierre>=0?celFecha(r[mq.cierre]):'',
-      motivoPerdida:mq.motivo>=0?celTxt(r[mq.motivo]):'',lineas:[]});}
+      motivoPerdida:mq.motivo>=0?celTxt(r[mq.motivo]):'',lineas:[],
+      rev:mq.rev>=0?(celNum(r[mq.rev])||0):0,versiones:[],_proyNom:mq.proy>=0?celTxt(r[mq.proy]):''});}
   let contactos=[];
   if(CT){const hp=hdrRow(CT,['Nombre','Cuenta']);
     if(hp>=0){const P=CT[hp],g3=(...n)=>colIdx(P,...n);
@@ -661,11 +740,32 @@ function importarLibro(buf){
         tareas.push({id:uid(),cuenta:celTxt(r[mt.cuenta]),texto:celTxt(r[mt.texto]),tipo:celTxt(r[mt.tipo])||'mio',
           fecha:celFecha(r[mt.fecha]),hecha:norm(celTxt(r[mt.hecha]))==='si',creada:iso(HOY)});}}}
   if(!hojaTareas)tareas.push(...tareasDeColumna);
-  const st={version:2,importado:iso(HOY),cuentas,cotizaciones:cots,contactos,tareas,bitacora:[]};
+  const proyectos=[];
+  if(PR){ const hp=hdrRow(PR,['Cuenta','Proyecto']);
+    if(hp>=0){ const P=PR[hp],g5=(...n)=>colIdx(P,...n);
+      const mp={cuenta:g5('Cuenta'),nombre:g5('Proyecto'),comuna:g5('Comuna'),direccion:g5('Dirección'),
+        mandante:g5('Mandante'),estado:g5('Estado'),inicio:g5('Inicio'),notas:g5('Notas')};
+      for(let i=hp+1;i<PR.length;i++){const r=PR[i]||[];if(!celTxt(r[mp.nombre]))continue;
+        proyectos.push({pid:uid(),cuenta:celTxt(r[mp.cuenta]),nombre:celTxt(r[mp.nombre]),comuna:celTxt(r[mp.comuna]),
+          direccion:celTxt(r[mp.direccion]),mandante:celTxt(r[mp.mandante]),estado:celTxt(r[mp.estado])||'Activo',
+          inicio:celFecha(r[mp.inicio]),notas:celTxt(r[mp.notas])});}}}
+  cots.forEach(q=>{ if(!q._proyNom)return;
+    const p=proyectos.find(x=>x.cuenta===q.cuenta&&norm(x.nombre)===norm(q._proyNom));
+    if(p)q.proyecto=p.pid; delete q._proyNom; });
+  if(LI){ const hl=hdrRow(LI,['Folio','Familia']);
+    if(hl>=0){ const L=LI[hl],g6=(...n)=>colIdx(L,...n);
+      const ml={folio:g6('Folio'),cuenta:g6('Cuenta'),familia:g6('Familia'),producto:g6('Descripción','Producto'),
+        kg:g6('kg'),precioKg:g6('$/kg'),monto:g6('Monto fijo')};
+      for(let i=hl+1;i<LI.length;i++){ const r=LI[i]||[]; const f=celTxt(r[ml.folio]); if(!f)continue;
+        const q=cots.find(x=>x.folio===f&&(ml.cuenta<0||x.cuenta===celTxt(r[ml.cuenta])));
+        if(!q)continue;
+        q.lineas.push({id:uid(),familia:celTxt(r[ml.familia])||'Otro',producto:celTxt(r[ml.producto]),
+          kg:celNum(r[ml.kg])||null,precioKg:celNum(r[ml.precioKg])||null,monto:celNum(r[ml.monto])||null}); } } }
+  const st={version:3,importado:iso(HOY),cuentas,proyectos,cotizaciones:cots,contactos,tareas,bitacora:[]};
   st.cotizaciones.forEach(x=>{if(x.nota)st.bitacora.push({id:uid(),cuenta:x.cuenta,ts:x.fecha||iso(HOY),tipo:'cotizacion',texto:'['+x.folio+'] '+x.nota});});
   st.cuentas.forEach(c=>{if(c.notas)st.bitacora.push({id:uid(),cuenta:c.nombre,ts:iso(HOY),tipo:'nota',texto:'[del Excel] '+c.notas});});
   if(!st.cuentas.length)throw new Error('No leí ninguna cuenta. ¿Es el archivo correcto?');
-  return st;
+  return migrar(st);
 }
 function xlsxBlob(){
   if(typeof XLSX==='undefined')return null;
@@ -678,7 +778,12 @@ function xlsxBlob(){
     ['Cotiz. vivas',c=>cotsDe(c.nombre).filter(VIVA).length],['Monto vivo (neto)',c=>cotsDe(c.nombre).filter(VIVA).reduce((a,q)=>a+(q.neto||0),0)],
     ['Próxima acción',c=>proxTarea(c.nombre)?.texto||''],['Fecha próx. acción',c=>proxTarea(c.nombre)?.fecha||''],
     ['Archivada',c=>c.archivada?'sí':''],['Notas',c=>c.notas]],S.cuentas);
-  hoja('COTIZACIONES',[['Folio',q=>q.folio],['Fecha emisión',q=>q.fecha],['Cuenta',q=>q.cuenta],['Obra / alcance',q=>q.obra],
+  hoja('PROYECTOS',[['Cuenta',p=>p.cuenta],['Proyecto',p=>p.nombre],['Comuna',p=>p.comuna],['Dirección',p=>p.direccion],
+    ['Mandante',p=>p.mandante],['Estado',p=>p.estado],['Inicio',p=>p.inicio],
+    ['Cotizaciones',p=>cotsDeProy(p.pid).length],['Monto vivo',p=>cotsDeProy(p.pid).filter(VIVA).reduce((a,q)=>a+(q.neto||0),0)],
+    ['Notas',p=>p.notas]],S.proyectos);
+  hoja('COTIZACIONES',[['Folio',q=>q.folio],['Rev',q=>q.rev||0],['Proyecto',q=>proyecto(q.proyecto)?.nombre||''],
+    ['Fecha emisión',q=>q.fecha],['Cuenta',q=>q.cuenta],['Obra / alcance',q=>q.obra],
     ['Contacto',q=>q.contacto],['Email',q=>q.email],['Producto',q=>q.producto],['Total neto',q=>q.neto],['kg',q=>q.kg||''],
     ['$/kg',q=>q.kg?Math.round(q.neto/q.kg):''],['Validez hasta',q=>q.validez],['ESTADO',q=>q.estado],['Prob.',q=>probEf(q)],
     ['Ponderado',q=>Math.round(ponderadoAj(q))],['Cierre est.',q=>q.cierre],['N° OC',q=>q.oc],
@@ -687,6 +792,10 @@ function xlsxBlob(){
   hoja('LINEAS',[['Folio',l=>l.folio],['Cuenta',l=>l.cuenta],['Familia',l=>l.familia],['Descripción',l=>l.producto],
     ['kg',l=>l.kg||''],['$/kg',l=>l.precioKg||''],['Monto fijo',l=>l.monto||''],
     ['Total',l=>Math.round((Number(l.kg)||0)*(Number(l.precioKg)||0)+(Number(l.monto)||0))]],lin);
+  const vers=[]; S.cotizaciones.forEach(q=>(q.versiones||[]).forEach(v=>vers.push({...v,folio:q.folio,cuenta:q.cuenta})));
+  hoja('VERSIONES',[['Folio',v=>v.folio],['Rev',v=>v.rev],['Cuenta',v=>v.cuenta],['Guardada el',v=>v.ts],
+    ['Neto',v=>v.neto],['kg',v=>v.kg||''],['Validez',v=>v.validez],['Etapa',v=>v.estado],
+    ['Motivo del cambio',v=>v.motivo||'']],vers);
   hoja('CONTACTOS',[['Cuenta',c=>c.cuenta],['Nombre',c=>c.nombre],['Cargo / rol',c=>c.cargo],['Email',c=>c.email],
     ['Teléfono',c=>c.tel],['Decide / influye',c=>c.rol],['Nota',c=>c.nota]],S.contactos);
   hoja('TAREAS',[['Cuenta',t=>t.cuenta],['Tarea',t=>t.texto],['Tipo',t=>t.tipo],['Fecha',t=>t.fecha],
@@ -943,6 +1052,7 @@ function badge(k){
   if(k==='tareas')return S.tareas.filter(t=>!t.hecha).length||'';
   if(k==='pipeline')return S.cotizaciones.filter(VIVA).length;
   if(k==='cuentas')return activas().length;
+  if(k==='proyectos')return S.proyectos.length;
   if(k==='contactos')return S.contactos.length;
   if(k==='salud')return checks().filter(c=>c.sev==='alta'&&c.items.length).length||'';
   return '';
@@ -979,7 +1089,7 @@ VIEWS.hoy=function(v){
     const d=dias(q.validez);
     cv.append(el('div',{class:'row'},
       el('div',{class:'main'},
-        el('div',{class:'t'},el('button',{class:'linkish',onclick:()=>abrir(q.cuenta,'cots')},q.folio+' · '+q.cuenta)),
+        el('div',{class:'t'},el('button',{class:'linkish',onclick:()=>abrir(q.cuenta,'proy')},q.folio+' · '+q.cuenta)),
         el('div',{class:'d'},q.obra),
         el('div',{class:'d',style:'font-family:var(--mono);font-size:11px'},money(q.neto)+' · '+(d<0?'vencida hace '+Math.abs(d)+' días':'vence en '+d+' días'))),
       el('div',{class:'acts'},
@@ -1106,7 +1216,7 @@ VIEWS.pipeline=function(v){
         el('div',{class:'m'},money(q.neto),el('span',{style:'font-weight:400;color:var(--ink3);font-size:11px'},'  ×'+Math.round(probEf(q)*100)+'%')));
       card.addEventListener('dragstart',e=>{e.dataTransfer.setData('text/plain',q.qid);card.classList.add('drag');});
       card.addEventListener('dragend',()=>card.classList.remove('drag'));
-      card.addEventListener('click',()=>abrir(q.cuenta,'cots'));
+      card.addEventListener('click',()=>abrir(q.cuenta,'proy'));
       col.append(card);
     });
     col.addEventListener('dragover',e=>{e.preventDefault();col.classList.add('over');});
@@ -1196,6 +1306,138 @@ function pintaCuentas(){
   }
 }
 
+/* ============ PROYECTOS ============ */
+VIEWS.proyectos=function(view){
+  const conVivo=S.proyectos.filter(p=>cotsDeProy(p.pid).some(VIVA));
+  view.append(el('div',{class:'kpis'},
+    kpi('Proyectos',String(S.proyectos.length),conVivo.length+' con oferta viva'),
+    kpi('Monto vivo',money(S.cotizaciones.filter(VIVA).reduce((a,q)=>a+(q.neto||0),0)),'suma de todos'),
+    kpi('Sin cotizar',String(S.proyectos.filter(p=>!cotsDeProy(p.pid).length).length),'proyectos sin ninguna oferta','warn'),
+    kpi('Cuentas con proyecto',String(new Set(S.proyectos.map(p=>p.cuenta)).size),'de '+activas().length+' cuentas')));
+  const card=el('div',{class:'card sec'},el('h3',{},'Proyectos',el('span',{class:'n'},String(S.proyectos.length)),
+    el('span',{class:'hint'},'una obra puede tener varias cotizaciones y cada una varias revisiones'),
+    el('span',{class:'sp'}),el('button',{class:'mini k',onclick:()=>crearProyecto()},'+ Nuevo proyecto')));
+  const host=el('div',{class:'tablewrap'});
+  const t=el('table',{},el('thead',{},el('tr',{},el('th',{class:'nosort'},'Cuenta'),el('th',{class:'nosort'},'Proyecto'),
+    el('th',{class:'nosort'},'Comuna'),el('th',{class:'nosort'},'Mandante'),el('th',{class:'nosort'},'Estado'),
+    el('th',{class:'nosort'},'Cot.'),el('th',{class:'nosort'},'Rev.'),el('th',{class:'nosort'},'Monto vivo'),
+    el('th',{class:'nosort'},'Ganado'),el('th',{class:'nosort'},''))));
+  const tb=el('tbody');
+  S.proyectos.slice().sort((a,b)=>{
+    const va=cotsDeProy(a.pid).filter(VIVA).reduce((s,q)=>s+(q.neto||0),0);
+    const vb=cotsDeProy(b.pid).filter(VIVA).reduce((s,q)=>s+(q.neto||0),0);
+    return vb-va||a.cuenta.localeCompare(b.cuenta);}).forEach(p=>{
+    const qs=cotsDeProy(p.pid),vivas=qs.filter(VIVA);
+    const revs=qs.reduce((a,q)=>a+(q.versiones||[]).length+1,0);
+    tb.append(el('tr',{},
+      el('td',{},el('button',{class:'linkish',onclick:()=>abrir(p.cuenta)},p.cuenta)),
+      el('td',{},el('button',{class:'linkish',onclick:()=>{UI.openProy=p.pid;abrir(p.cuenta,'proy');}},p.nombre)),
+      el('td',{},edit(p,'comuna',{})),el('td',{},edit(p,'mandante',{})),
+      el('td',{},edit(p,'estado',{options:EST_PROY})),
+      el('td',{class:'num'},qs.length||''),el('td',{class:'num'},revs||''),
+      el('td',{class:'num'},vivas.length?money(vivas.reduce((a,q)=>a+(q.neto||0),0)):'—'),
+      el('td',{class:'num'},money(qs.filter(q=>q.estado==='Adjudicada').reduce((a,q)=>a+(q.neto||0),0))),
+      el('td',{},el('button',{class:'mini',onclick:()=>crearCotizacion(p.cuenta,p.pid)},'+ Cot.'),' ',
+        el('button',{class:'mini dgr',onclick:()=>borrar('proyecto',p)},'×'))));
+  });
+  t.append(tb); host.append(t); card.append(host); view.append(card);
+  if(!S.proyectos.length)host.append(el('div',{class:'empty'},'Sin proyectos todavía.'));
+};
+
+/* ============ COTIZADOR EMBEBIDO ============ */
+let COT_CTX=null, COT_READY=false;
+function abrirCotizador(ctx){ COT_CTX=ctx||null; COT_READY=false; UI.tab='cotizador'; UI.open=null; render(); }
+VIEWS.cotizador=function(view){
+  const barra=el('div',{class:'card',style:'margin-top:14px'},el('h3',{},'Cotizador ACMA',
+    el('span',{class:'hint'},COT_CTX?('precargado con '+COT_CTX.cuenta):'genera la oferta y quedará registrada en el CRM'),
+    el('span',{class:'sp'}),
+    el('button',{class:'mini',onclick:()=>window.open('cotizador.html','_blank')},'Abrir en pestaña aparte'),
+    el('button',{class:'mini',onclick:()=>{COT_CTX=null;render();}},'Empezar en blanco')));
+  const marco=el('iframe',{src:'cotizador.html',id:'cotFrame',
+    style:'width:100%;height:78vh;border:1px solid var(--rule);border-radius:var(--r);background:#fff;margin-top:14px;display:block'});
+  view.append(barra,marco);
+};
+window.addEventListener('message',ev=>{
+  const m=ev.data; if(!m||typeof m!=='object'||!String(m.tipo||'').startsWith('acma-cot'))return;
+  if(m.tipo==='acma-cot-listo'){
+    COT_READY=true;
+    const f=$('#cotFrame'); if(!f)return;
+    const ctx=contextoCotizador();
+    f.contentWindow.postMessage({tipo:'acma-cot-contexto',campos:ctx},'*');
+    return;
+  }
+  if(m.tipo==='acma-cot-guardar'){ recibirCotizacion(m); return; }
+});
+function contextoCotizador(){
+  if(!COT_CTX)return {};
+  const c=cuenta(COT_CTX.cuenta), p=COT_CTX.proyecto?proyecto(COT_CTX.proyecto):null;
+  const q=COT_CTX.qid?S.cotizaciones.find(x=>x.qid===COT_CTX.qid):null;
+  const pr=contactosDe(COT_CTX.cuenta).find(x=>x.rol==='Decide')||contactosDe(COT_CTX.cuenta)[0];
+  return {cliente:c?.nombre||'',contacto:(q?.contacto)||pr?.nombre||c?.contacto||'',
+    obra:q?.obra||p?.nombre||'',comuna:p?.comuna||'',folio:q?q.folio:siguienteFolio(),
+    rev:q?String((q.rev||0)+0):'0',
+    e_correo:pr?.email||c?.email||'',fvalida:q?.validez||''};
+}
+function recibirCotizacion(m){
+  const r=m.resumen||{};
+  const cn=cuenta(r.cliente)?r.cliente:(COT_CTX?.cuenta||r.cliente);
+  let c=cuenta(cn);
+  snap('cotización desde el cotizador');
+  if(!c){ const ids=S.cuentas.map(x=>+String(x.id).replace(/\D/g,'')||0);
+    c={cid:uid(),id:'C'+String(Math.max(0,...ids)+1).padStart(2,'0'),nombre:cn||'Cliente sin nombre',seg:'',tipo:'Constructora',
+      grupo:'',contacto:r.contacto||'',cargo:'',email:'',tel:'',ultMio:'',ultSuyo:'',hablo:'nadie',
+      canal:'EN NEGOCIACIÓN',prio:'B - Media',notas:'',archivada:false};
+    S.cuentas.push(c); }
+  const nomProy=(COT_CTX?.proyecto&&proyecto(COT_CTX.proyecto)?.nombre)||r.obra||'Obra sin definir';
+  let p=S.proyectos.find(x=>x.cuenta===c.nombre&&norm(x.nombre)===norm(nomProy));
+  if(!p){ p={pid:uid(),cuenta:c.nombre,nombre:nomProy,comuna:r.comuna||'',direccion:'',mandante:'',
+    estado:'Activo',inicio:'',notas:''}; S.proyectos.push(p); }
+  else if(!p.comuna&&r.comuna)p.comuna=r.comuna;
+  const lineas=(m.lineas||[]).map(l=>({id:uid(),familia:l.familia||'Otro',producto:l.producto||'',
+    kg:l.kg||null,precioKg:l.precioKg||null,monto:l.monto||null}));
+  /* El neto que manda el cotizador es el que vio el cliente: manda ese.
+     Si las líneas no lo suman, se agrega una línea explícita con la diferencia
+     en vez de dejar dos cifras distintas conviviendo en silencio. */
+  const netoCot=Math.round(Number(r.neto)||0);
+  const sumaLin=Math.round(lineas.reduce((a,l)=>a+(Number(l.kg)||0)*(Number(l.precioKg)||0)+(Number(l.monto)||0),0));
+  let desajuste=0;
+  if(lineas.length&&netoCot&&Math.abs(netoCot-sumaLin)>Math.max(1000,netoCot*0.005)){
+    desajuste=netoCot-sumaLin;
+    lineas.push({id:uid(),familia:'Otro',producto:desajuste>0?'Diferencia con el total del cotizador':'Descuento o ajuste',
+      kg:null,precioKg:null,monto:desajuste});
+  }
+  let q=S.cotizaciones.find(x=>x.folio===r.folio&&x.cuenta===c.nombre);
+  const rev=Number(r.rev||0);
+  if(q){
+    if(rev>(q.rev||0)){ q.versiones=q.versiones||[];
+      q.versiones.unshift({rev:q.rev||0,ts:iso(HOY),fecha:q.fecha,neto:q.neto,kg:q.kg,validez:q.validez,
+        estado:q.estado,lineas:JSON.parse(JSON.stringify(q.lineas||[])),nota:q.nota,motivo:'reemplazada por r'+rev+' del cotizador'}); }
+    q.rev=rev; q.neto=r.neto||0; q.kg=r.kg||null; q.validez=r.fvalida||q.validez; q.obra=r.obra||q.obra;
+    q.contacto=r.contacto||q.contacto; q.lineas=lineas; q.proyecto=p.pid;
+    if(q.estado==='Por enviar')q.estado='Enviada';
+    logB(c.nombre,'cotizacion','['+q.folio+' r'+rev+'] actualizada desde el cotizador: '+money(q.neto)+(q.kg?' · '+num(q.kg)+' kg':''));
+  }else{
+    q={qid:uid(),folio:r.folio||siguienteFolio(),rev,versiones:[],fecha:r.femision||iso(HOY),cuenta:c.nombre,
+      proyecto:p.pid,obra:r.obra||p.nombre,contacto:r.contacto||'',email:'',producto:'',neto:r.neto||0,kg:r.kg||null,
+      validez:r.fvalida||'',estado:'Enviada',prob:null,probManual:false,oc:'',nota:r.glosa||'',cierre:'',
+      motivoPerdida:'',lineas};
+    S.cotizaciones.unshift(q);
+    logB(c.nombre,'cotizacion','['+q.folio+' r'+rev+'] creada desde el cotizador: '+money(q.neto));
+    nuevaTarea(c.nombre,'Confirmar recepción de '+q.folio,iso(new Date(HOY.getTime()+3*864e5)),'esperando',q.folio);
+  }
+  if(desajuste)logB(c.nombre,'cotizacion','['+q.folio+'] las líneas no sumaban el total: se agregó una línea de ajuste por '+money(desajuste)+'. Revisa el desglose.');
+  guardarSnapshotCot(q,m.snapshot);
+  save(); render();
+  toast(q.folio+' r'+rev+' registrada en '+c.nombre+' · '+lineas.length+' líneas',['Ver',()=>{UI.openProy=p.pid;UI.openCot=q.qid;abrir(c.nombre,'proy');}]);
+}
+async function guardarSnapshotCot(q,snapshot){
+  if(!DIR||!snapshot)return;
+  try{ const sub=await DIR.getDirectoryHandle('cotizaciones',{create:true});
+    const fh=await sub.getFileHandle(String(q.folio).replace(/[^\w\-]/g,'_')+'_r'+(q.rev||0)+'.json',{create:true});
+    const w=await fh.createWritable(); await w.write(new Blob([JSON.stringify(snapshot)],{type:'application/json'})); await w.close();
+  }catch(e){}
+}
+
 /* ============ COTIZACIONES ============ */
 VIEWS.cotizaciones=function(v){
   const f=el('div',{class:'filters'});
@@ -1222,8 +1464,9 @@ VIEWS.cotizaciones=function(v){
   rows.forEach(q=>{
     const d=dias(q.validez),conLin=(q.lineas||[]).length>0;
     tb.append(el('tr',{},
-      el('td',{class:'mono'},edit(q,'folio',{desc:'editar folio'}),el('div',{style:'color:var(--ink3);font-size:10.5px'},edit(q,'fecha',{type:'date',fmt:s=>s?fdate(s):''}))),
-      el('td',{},el('button',{class:'linkish',onclick:()=>abrir(q.cuenta,'cots')},q.cuenta),
+      el('td',{class:'mono'},edit(q,'folio',{desc:'editar folio'}),q.rev?el('span',{class:'pill p-gry'},'r'+q.rev):null,el('div',{style:'color:var(--ink3);font-size:10.5px'},edit(q,'fecha',{type:'date',fmt:s=>s?fdate(s):''}))),
+      el('td',{},el('button',{class:'linkish',onclick:()=>{UI.openProy=q.proyecto;UI.openCot=q.qid;abrir(q.cuenta,'proy');}},q.cuenta),
+        el('div',{style:'color:var(--ink3);font-size:11px'},proyecto(q.proyecto)?.nombre||'sin proyecto'),
         el('div',{style:'color:var(--ink2);font-size:11.5px'},edit(q,'obra',{blk:true}))),
       el('td',{},edit(q,'estado',{options:ETAPAS,after:(nv,ov)=>{q.probManual=false;logB(q.cuenta,'cotizacion','['+q.folio+'] '+ov+' → '+nv);}})),
       el('td',{class:'num'},conLin?el('span',{title:'suma de las líneas'},num(q.neto)):
@@ -1242,7 +1485,7 @@ VIEWS.cotizaciones=function(v){
         d===null?el('span',{class:'pill p-gry'},'sin vigencia'):el('span',{class:'pill '+(d<0?'p-red':d<=7?'p-yel':'p-gry')},d<0?Math.abs(d)+'d tarde':d+'d')),
       el('td',{},edit(q,'cierre',{type:'date',fmt:s=>s?fdate(s):''})),
       el('td',{},q.estado==='Perdida'?edit(q,'motivoPerdida',{blk:true}):edit(q,'oc',{})),
-      el('td',{class:'mono'},el('button',{class:'mini',onclick:()=>reemitir(q)},'Reemitir'),' ',
+      el('td',{class:'mono'},el('button',{class:'mini',onclick:()=>nuevaRevision(q)},'+rev'),' ',
         el('button',{class:'mini dgr',onclick:()=>borrar('cotizacion',q)},'×'))));
   });
   t.append(tb); host.append(t); card.append(host); v.append(card);
@@ -1302,6 +1545,10 @@ function checks(){
     S.cotizaciones.filter(q=>VIVA(q)&&!q.cierre).map(q=>q.folio));
   add('media','Cuenta con oferta viva y un solo contacto','Riesgo de hilo único: si esa persona no contesta, la oferta muere.',
     activas().filter(c=>cotsDe(c.nombre).some(VIVA)&&contactosDe(c.nombre).length<2).map(c=>c.nombre));
+  add('media','Proyectos sin ninguna cotización','Una obra identificada y no cotizada es una oportunidad que se está enfriando.',
+    S.proyectos.filter(p=>!cotsDeProy(p.pid).length).map(p=>p.nombre+' ('+p.cuenta+')'));
+  add('baja','Proyectos sin comuna','Sin comuna no se puede calcular el flete ni agrupar por zona.',
+    S.proyectos.filter(p=>!p.comuna).map(p=>p.nombre));
   add('baja','Cuentas sin ninguna tarea abierta','Una cuenta sin próximo paso es una cuenta que ya se soltó.',
     activas().filter(c=>!abiertas(c.nombre).length).map(c=>c.nombre));
   add('baja','Contactos sin teléfono','El correo solo no basta cuando hay que empujar.',
@@ -1339,7 +1586,7 @@ VIEWS.salud=function(v){
 };
 
 /* ============ FICHA DE CUENTA ============ */
-const DTABS=[['ficha','Ficha'],['tareas','Tareas'],['cots','Cotizaciones'],['gente','Personas'],['bita','Bitácora']];
+const DTABS=[['ficha','Ficha'],['tareas','Tareas'],['proy','Proyectos'],['gente','Personas'],['bita','Bitácora']];
 function drawer(nombre){
   const c=cuenta(nombre); if(!c){UI.open=null;return;}
   document.querySelectorAll('.scrim,.drawer').forEach(n=>n.remove());
@@ -1353,7 +1600,7 @@ function drawer(nombre){
     el('button',{class:'closeb',onclick:close,'aria-label':'cerrar'},'×'));
   const tt=el('div',{class:'tt'});
   DTABS.forEach(([k,l])=>{
-    const n={tareas:abiertas(nombre).length,cots:cotsDe(nombre).length,gente:contactosDe(nombre).length,bita:bitaDe(nombre).length}[k];
+    const n={tareas:abiertas(nombre).length,proy:proyectosDe(nombre).length,gente:contactosDe(nombre).length,bita:bitaDe(nombre).length}[k];
     tt.append(el('button',{'aria-current':UI.dtab===k?'true':'false',onclick:()=>{UI.dtab=k;render();}},l,
       n?el('span',{class:'cnt'},String(n)):null));
   });
@@ -1364,10 +1611,11 @@ function drawer(nombre){
     el('button',{class:'mini',onclick:()=>registrarContacto(c,'suyo')},'Me respondió hoy'),
     c.email?el('a',{class:'mini',href:'mailto:'+c.email},'Correo'):null,
     c.tel?el('a',{class:'mini',href:'tel:'+String(c.tel).replace(/\s/g,'')},'Llamar'):null,
+    el('button',{class:'mini',onclick:()=>abrirCotizador({cuenta:c.nombre})},'Cotizar'),
     el('span',{style:'flex:1'}),
     el('button',{class:'mini',onclick:()=>mut('archivar',()=>{c.archivada=!c.archivada;})},c.archivada?'Desarchivar':'Archivar'),
     el('button',{class:'mini dgr',onclick:()=>borrar('cuenta',c)},'Borrar cuenta')));
-  ({ficha:dFicha,tareas:dTareas,cots:dCots,gente:dGente,bita:dBita}[UI.dtab]||dFicha)(b,c);
+  ({ficha:dFicha,tareas:dTareas,proy:dProy,cots:dProy,gente:dGente,bita:dBita}[UI.dtab]||dFicha)(b,c);
   d.append(b); document.body.append(scrim,d);
   const onKey=ev=>{if(ev.key==='Escape'&&!document.querySelector('.modal')&&!document.querySelector('.cmdk')){close();document.removeEventListener('keydown',onKey);}};
   document.addEventListener('keydown',onKey);
@@ -1414,44 +1662,106 @@ function dTareas(b,c){
     s2.append(bx); b.append(s2);
   }
 }
-function dCots(b,c){
-  const qs=cotsDe(c.nombre).sort((a,b2)=>(b2.fecha||'').localeCompare(a.fecha||''));
-  const s=el('div',{class:'dsec'},el('h4',{},'Cotizaciones',el('span',{class:'sp'}),
-    el('button',{class:'mini k',onclick:()=>crearCotizacion(c.nombre)},'+ Nueva')));
-  if(!qs.length)s.append(el('div',{class:'card'},el('div',{class:'empty'},'Sin cotizaciones. Crea una para empezar a cargar líneas.')));
-  qs.forEach(q=>{
-    const d=dias(q.validez);
+function dProy(b,c){
+  const ps=proyectosDe(c.nombre);
+  const s=el('div',{class:'dsec'},el('h4',{},'Proyectos',el('span',{class:'sp'}),
+    el('button',{class:'mini',onclick:()=>crearCotizacion(c.nombre)},'+ Cotización'),
+    el('button',{class:'mini k',onclick:()=>crearProyecto(c.nombre)},'+ Proyecto')));
+  if(!ps.length)s.append(el('div',{class:'card'},el('div',{class:'empty'},'Sin proyectos. Crea uno y cuélgale las cotizaciones.')));
+  ps.forEach(p=>{
+    const qs=cotsDeProy(p.pid),vivas=qs.filter(VIVA);
+    const ab=UI.openProy===p.pid;
     const card=el('div',{class:'card',style:'margin-bottom:11px'});
-    card.append(el('h3',{},edit(q,'folio',{}),
-      el('span',{class:'pill '+(q.estado==='Adjudicada'?'p-grn':q.estado==='Perdida'?'p-red':'p-blu')},q.estado),
+    card.append(el('h3',{},
+      el('button',{class:'mini',onclick:()=>{UI.openProy=ab?null:p.pid;render();}},ab?'▾':'▸'),
+      edit(p,'nombre',{desc:'renombrar proyecto'}),
+      el('span',{class:'pill '+(p.estado==='Activo'?'p-grn':p.estado==='Perdido'?'p-red':'p-gry')},p.estado||'—'),
       el('span',{class:'sp'}),
-      el('span',{style:'font-family:var(--mono);font-size:12px;color:var(--ink)'},money(q.neto)),
-      el('button',{class:'mini dgr',onclick:()=>borrar('cotizacion',q)},'×')));
-    const kv=el('dl',{class:'kv',style:'padding:10px 12px'});
-    const put=(k,v)=>{kv.append(el('dt',{},k),el('dd',{},v));};
-    put('Obra / alcance',edit(q,'obra',{blk:true}));
-    put('Etapa',edit(q,'estado',{options:ETAPAS,after:(nv,ov)=>{q.probManual=false;logB(q.cuenta,'cotizacion','['+q.folio+'] '+ov+' → '+nv);}}));
-    put('Contacto',edit(q,'contacto',{}));
-    put('Emitida',edit(q,'fecha',{type:'date',fmt:s2=>s2?fdate(s2):''}));
-    put('Válida hasta',el('span',{},edit(q,'validez',{type:'date',fmt:s2=>s2?fdate(s2):''}),' ',
-      d===null?el('span',{class:'pill p-gry'},'sin vigencia'):el('span',{class:'pill '+(d<0?'p-red':d<=7?'p-yel':'p-gry')},d<0?Math.abs(d)+'d tarde':d+'d')));
-    put('Cierre estimado',edit(q,'cierre',{type:'date',fmt:s2=>s2?fdate(s2):''}));
-    put('Probabilidad',el('span',{},Math.round(probEf(q)*100)+'%  ',
-      el('span',{style:'color:var(--ink3);font-size:11px'},q.probManual?'manual':'según etapa')));
-    put('Ponderado',money(ponderadoAj(q)));
-    if(q.estado==='Perdida')put('Motivo',edit(q,'motivoPerdida',{blk:true}));
-    else put('N° OC',edit(q,'oc',{}));
-    put('Nota',edit(q,'nota',{multiline:true,blk:true}));
+      el('span',{style:'font-family:var(--mono);font-size:11.5px;color:var(--ink2)'},
+        qs.length+(qs.length===1?' cotización':' cotizaciones')+' · '+money(vivas.reduce((a,q)=>a+(q.neto||0),0))+' vivo')));
+    if(!ab){ card.append(el('div',{style:'padding:7px 12px;font-size:11.5px;color:var(--ink3);font-family:var(--mono)'},
+      [p.comuna,p.mandante].filter(Boolean).join(' · ')||'sin comuna ni mandante')); s.append(card); return; }
+    const kv=el('dl',{class:'kv',style:'padding:10px 12px'}),put=(k,x)=>{kv.append(el('dt',{},k),el('dd',{},x));};
+    put('Estado',edit(p,'estado',{options:EST_PROY}));
+    put('Comuna',edit(p,'comuna',{}));
+    put('Dirección',edit(p,'direccion',{}));
+    put('Mandante',edit(p,'mandante',{}));
+    put('Inicio de obra',edit(p,'inicio',{type:'date',fmt:x=>x?fdate(x):''}));
+    put('Notas',edit(p,'notas',{multiline:true,blk:true}));
     card.append(kv);
-    card.append(tablaLineas(q));
+    qs.sort((a,b2)=>(b2.fecha||'').localeCompare(a.fecha||'')).forEach(q=>card.append(fichaCotizacion(q)));
+    if(!qs.length)card.append(el('div',{class:'empty'},'Este proyecto no tiene cotizaciones.'));
     card.append(el('div',{class:'addbar'},
-      el('button',{class:'mini',onclick:()=>reemitir(q)},'Reemitir'),
-      VIVA(q)?el('button',{class:'mini',onclick:()=>marcarPerdida(q)},'Marcar perdida'):null,
-      VIVA(q)?el('button',{class:'mini',onclick:()=>setEstadoCot(q,'Adjudicada')},'Marcar adjudicada'):null,
-      el('button',{class:'mini',onclick:()=>mut('tarea de seguimiento',()=>nuevaTarea(q.cuenta,'Seguimiento '+q.folio,iso(new Date(HOY.getTime()+3*864e5)),'esperando',q.folio))},'Agendar seguimiento')));
+      el('button',{class:'mini k',onclick:()=>crearCotizacion(c.nombre,p.pid)},'+ Cotización en este proyecto'),
+      el('button',{class:'mini',onclick:()=>abrirCotizador({cuenta:c.nombre,proyecto:p.pid})},'Cotizar con el cotizador'),
+      el('span',{style:'flex:1'}),
+      el('button',{class:'mini dgr',onclick:()=>borrar('proyecto',p)},'Borrar proyecto')));
     s.append(card);
   });
   b.append(s);
+}
+function selProyecto(q){
+  const ps=proyectosDe(q.cuenta);
+  const s=el('select',{class:'inline',style:'max-width:280px',onchange:e=>{
+    const val=e.target.value;
+    if(val==='__nuevo__'){ crearProyecto(q.cuenta).then(p=>{ if(p)mut('mover de proyecto',()=>{q.proyecto=p.pid;}); }); return; }
+    mut('mover de proyecto',()=>{q.proyecto=val;UI.openProy=val;});
+  }});
+  ps.forEach(p=>s.append(el('option',{value:p.pid,selected:p.pid===q.proyecto?'':null},p.nombre)));
+  s.append(el('option',{value:'__nuevo__'},'— crear proyecto nuevo —'));
+  return s;
+}
+function fichaCotizacion(q){
+  const d=dias(q.validez),ab=UI.openCot===q.qid,nv=(q.versiones||[]).length;
+  const w=el('div',{style:'border-top:1px solid var(--rule2)'});
+  const cab=el('div',{style:'display:flex;gap:8px;align-items:center;padding:8px 12px;background:var(--panel-2);flex-wrap:wrap'});
+  cab.append(el('button',{class:'mini',onclick:()=>{UI.openCot=ab?null:q.qid;render();}},ab?'▾':'▸'),
+    el('span',{style:'font-family:var(--mono);font-weight:600'},folioRev(q)),
+    el('span',{class:'pill '+(q.estado==='Adjudicada'?'p-grn':q.estado==='Perdida'?'p-red':'p-blu')},q.estado),
+    d===null?el('span',{class:'pill p-gry'},'sin vigencia'):el('span',{class:'pill '+(d<0?'p-red':d<=7?'p-yel':'p-gry')},d<0?Math.abs(d)+'d tarde':d+'d'),
+    nv?el('span',{class:'pill p-gry',title:'revisiones anteriores'},nv+' rev.'):null,
+    el('span',{style:'flex:1'}),
+    el('span',{style:'font-family:var(--mono);font-size:12.5px;font-weight:600'},money(q.neto)),
+    q.kg?el('span',{style:'font-family:var(--mono);font-size:11px;color:var(--ink3)'},num(q.kg)+' kg'):null);
+  w.append(cab);
+  if(!ab)return w;
+  const kv=el('dl',{class:'kv',style:'padding:10px 12px'}),put=(k,x)=>{kv.append(el('dt',{},k),el('dd',{},x));};
+  put('Folio',edit(q,'folio',{}));
+  put('Proyecto',selProyecto(q));
+  put('Alcance',edit(q,'obra',{blk:true}));
+  put('Etapa',edit(q,'estado',{options:ETAPAS,after:(a,o)=>{q.probManual=false;logB(q.cuenta,'cotizacion','['+q.folio+'] '+o+' → '+a);}}));
+  put('Contacto',edit(q,'contacto',{}));
+  put('Emitida',edit(q,'fecha',{type:'date',fmt:x=>x?fdate(x):''}));
+  put('Válida hasta',edit(q,'validez',{type:'date',fmt:x=>x?fdate(x):''}));
+  put('Cierre estimado',edit(q,'cierre',{type:'date',fmt:x=>x?fdate(x):''}));
+  put('Probabilidad',el('span',{},Math.round(probEf(q)*100)+'%  ',el('span',{style:'color:var(--ink3);font-size:11px'},q.probManual?'manual':'según etapa')));
+  put('Ponderado',money(ponderadoAj(q)));
+  if(q.estado==='Perdida')put('Motivo',edit(q,'motivoPerdida',{blk:true})); else put('N° OC',edit(q,'oc',{}));
+  put('Nota',edit(q,'nota',{multiline:true,blk:true}));
+  w.append(kv,tablaLineas(q));
+  w.append(el('div',{class:'addbar'},
+    el('button',{class:'mini k',onclick:()=>nuevaRevision(q)},'Nueva revisión'),
+    el('button',{class:'mini',onclick:()=>abrirCotizador({cuenta:q.cuenta,proyecto:q.proyecto,qid:q.qid})},'Abrir en el cotizador'),
+    el('button',{class:'mini',onclick:()=>reemitir(q)},'Reemitir con folio nuevo'),
+    VIVA(q)?el('button',{class:'mini',onclick:()=>marcarPerdida(q)},'Perdida'):null,
+    VIVA(q)?el('button',{class:'mini',onclick:()=>setEstadoCot(q,'Adjudicada')},'Adjudicada'):null,
+    el('button',{class:'mini',onclick:()=>mut('tarea de seguimiento',()=>nuevaTarea(q.cuenta,'Seguimiento '+folioRev(q),iso(new Date(HOY.getTime()+3*864e5)),'esperando',q.folio))},'Agendar seguimiento'),
+    el('span',{style:'flex:1'}),
+    el('button',{class:'mini dgr',onclick:()=>borrar('cotizacion',q)},'Borrar')));
+  if(nv){
+    const vt=el('table',{class:'lin'},el('thead',{},el('tr',{},el('th',{},'Rev'),el('th',{},'Guardada'),
+      el('th',{style:'text-align:right'},'Neto'),el('th',{style:'text-align:right'},'kg'),
+      el('th',{},'Etapa'),el('th',{},'Qué cambió'),el('th',{}))));
+    const tb=el('tbody');
+    q.versiones.forEach(x=>tb.append(el('tr',{},
+      el('td',{class:'mono'},'r'+x.rev),el('td',{class:'mono'},fdate(x.ts)),
+      el('td',{class:'num'},num(x.neto)),el('td',{class:'num'},num(x.kg)),
+      el('td',{},x.estado),el('td',{style:'font-size:11.5px;color:var(--ink2)'},x.motivo||'—'),
+      el('td',{},el('button',{class:'mini',onclick:()=>restaurarVersion(q,x)},'Restaurar')))));
+    vt.append(tb);
+    w.append(el('div',{style:'padding:0 0 4px'},el('div',{style:'padding:7px 12px 3px;font-family:var(--disp);font-size:11px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink3)'},'Revisiones anteriores'),vt));
+  }
+  return w;
 }
 function tablaLineas(q){
   const wrap=el('div',{});
@@ -1536,7 +1846,7 @@ function buscar(txt){
     el('div',{class:'t'},el('button',{class:'linkish',onclick:()=>abrir(c.nombre)},c.nombre)),
     el('div',{class:'d'},[c.contacto,c.email,c.tel,c.canal].filter(Boolean).join(' · ')))));
   mk('Cotizaciones',qs,q=>el('div',{class:'row'},el('div',{class:'main'},
-    el('div',{class:'t'},el('button',{class:'linkish',onclick:()=>abrir(q.cuenta,'cots')},q.folio+' · '+q.cuenta+' · '+money(q.neto))),
+    el('div',{class:'t'},el('button',{class:'linkish',onclick:()=>abrir(q.cuenta,'proy')},q.folio+' · '+q.cuenta+' · '+money(q.neto))),
     el('div',{class:'d'},q.obra+' · '+q.estado+' · validez '+fdate(q.validez)))));
   mk('Personas',ps,p=>el('div',{class:'row'},el('div',{class:'main'},
     el('div',{class:'t'},el('button',{class:'linkish',onclick:()=>abrir(p.cuenta,'gente')},p.nombre+' — '+p.cuenta)),
@@ -1561,7 +1871,7 @@ function cmdk(){
       S.cuentas.filter(c=>norm(c.nombre+c.contacto+c.id).includes(n)).slice(0,7)
         .forEach(c=>items.push({k:'cuenta',n:c.nombre,s:[c.canal,c.prio].join(' · '),go:()=>abrir(c.nombre)}));
       S.cotizaciones.filter(q=>norm(q.folio+q.cuenta+q.obra).includes(n)).slice(0,6)
-        .forEach(q=>items.push({k:'cotiz',n:q.folio+' · '+money(q.neto),s:q.cuenta+' — '+q.obra,go:()=>abrir(q.cuenta,'cots')}));
+        .forEach(q=>items.push({k:'cotiz',n:q.folio+' · '+money(q.neto),s:q.cuenta+' — '+q.obra,go:()=>abrir(q.cuenta,'proy')}));
       S.contactos.filter(p=>norm(p.nombre+p.cuenta).includes(n)).slice(0,5)
         .forEach(p=>items.push({k:'persona',n:p.nombre,s:p.cuenta+(p.cargo?' — '+p.cargo:''),go:()=>abrir(p.cuenta,'gente')}));
     }else{
