@@ -405,10 +405,18 @@ textarea.inl{min-height:72px;resize:vertical;line-height:1.5}
 .doc .barra-doc{display:flex;gap:7px;align-items:center;padding:10px var(--s5);background:var(--panel2);
   border-bottom:1px solid var(--linea);flex-wrap:wrap}
 @media print{
-  .rail,.bar,.barra-doc,.adder{display:none!important}
-  body{overflow:visible;background:#fff}.cuerpo{overflow:visible;padding:0}
-  .doc{border:0;box-shadow:none;border-radius:0}.ed{background:none!important;box-shadow:none!important}
+  /* el contenedor tiene alto fijo y desbordamiento oculto: al imprimir hay que soltarlo
+     o el papel se corta a la altura de una pantalla */
+  html,body{height:auto!important;overflow:visible!important;background:#fff}
+  .app{display:block!important;height:auto!important;overflow:visible!important}
+  .marco{display:block!important;height:auto!important;overflow:visible!important}
+  .cuerpo{overflow:visible!important;height:auto!important;padding:0!important}
+  .rail,.bar,.barra-doc,.adder,.b,.grupo,.masiva,.aviso{display:none!important}
+  .doc{border:0;box-shadow:none;border-radius:0}
+  .ed{background:none!important;box-shadow:none!important}
   .ed::after{display:none}
+  table,tr,td,th,.doc{break-inside:auto}
+  thead{display:table-header-group}
 }
 
 /* ============ vacíos ============ */
@@ -1497,6 +1505,51 @@ function descargarDoc(q){
   document.body.append(a);a.click();a.remove();
 }
 
+/* ---------- leer y guardar el PDF de una cotización ---------- */
+let PDF_URL=null, PDF_CLAVE=null;
+async function urlPDF(q){
+  const k=claveDoc(q);
+  if(PDF_CLAVE===k&&PDF_URL)return PDF_URL;
+  if(PDF_URL){ URL.revokeObjectURL(PDF_URL); PDF_URL=null; PDF_CLAVE=null; }
+  const h=await subcarpeta(D_PDF,false); if(!h)return null;
+  try{ const fh=await h.getFileHandle(k+'.pdf'); const f=await fh.getFile();
+    PDF_URL=URL.createObjectURL(f); PDF_CLAVE=k; return PDF_URL; }catch(e){ return null; }
+}
+async function guardarPDF(q,file){
+  if(!file)return false;
+  if(!/\.pdf$/i.test(file.name)){ toast('Solo archivos PDF'); return false; }
+  const k=claveDoc(q);
+  try{
+    await escribirEn(D_PDF,k+'.pdf',file);
+    ARCHIVO[k]=Object.assign(ARCHIVO[k]||{},{pdf:true});
+    if(PDF_CLAVE===k&&PDF_URL){ URL.revokeObjectURL(PDF_URL); PDF_URL=null; PDF_CLAVE=null; }
+    toast('PDF guardado como '+k+'.pdf');
+    return true;
+  }catch(e){ toast('No se pudo guardar el PDF'); return false; }
+}
+async function borrarPDF(q){
+  if(!await confirmar('Borrar el PDF archivado de '+folioRev(q)+'.','Borrar'))return;
+  const k=claveDoc(q);
+  try{ const h=await subcarpeta(D_PDF,false); if(h)await h.removeEntry(k+'.pdf');
+    if(ARCHIVO[k])delete ARCHIVO[k].pdf;
+    if(PDF_CLAVE===k&&PDF_URL){ URL.revokeObjectURL(PDF_URL); PDF_URL=null; PDF_CLAVE=null; }
+    render(); toast('PDF borrado'); }catch(e){ toast('No se pudo borrar'); }
+}
+
+/* imprimir el documento en una ventana limpia: sin el marco de la aplicación
+   no hay CSS que pueda recortarlo, y sale idéntico al archivo guardado */
+function imprimirDoc(q){
+  const v=window.open('','_blank','width=980,height=1200');
+  if(!v){ toast('El navegador bloqueó la ventana. Permite las ventanas emergentes de este sitio.'); return; }
+  v.document.open(); v.document.write(htmlCotizacion(q)); v.document.close();
+  const lanzar=()=>{ try{ v.focus(); v.print(); }catch(e){} };
+  if(v.document.readyState==='complete')setTimeout(lanzar,250); else v.onload=()=>setTimeout(lanzar,250);
+}
+function verDocAparte(q){
+  const b=new Blob([htmlCotizacion(q)],{type:'text/html;charset=utf-8'});
+  window.open(URL.createObjectURL(b),'_blank');
+}
+
 /* ---- DASHBOARD ---- */
 const NS='http://www.w3.org/2000/svg';
 const sv=(t,a={},...k)=>{const n=document.createElementNS(NS,t);
@@ -2493,7 +2546,8 @@ function tablaCotizaciones(p,c){
   const t=el('table',{class:'cots'},el('thead',{},el('tr',{},
     el('th',{style:'width:26px'},''),el('th',{},'Folio'),el('th',{},'Alcance'),el('th',{},'Etapa'),
     el('th',{style:'text-align:right'},'Neto'),el('th',{style:'text-align:right'},'kg'),
-    el('th',{style:'text-align:right'},'$/kg'),el('th',{},'Vigencia'),el('th',{},'Rev.'))));
+    el('th',{style:'text-align:right'},'$/kg'),el('th',{},'Vigencia'),el('th',{},'Rev.'),
+    el('th',{style:'width:48px'},'PDF'),el('th',{style:'width:152px'},''))));
   const tb=el('tbody');
   qs.forEach(q=>{
     const d=dias(q.validez),abierta=UI.openCot===q.qid,nv=(q.versiones||[]).length;
@@ -2508,6 +2562,9 @@ function tablaCotizaciones(p,c){
       el('td',{class:'n'},q.kg&&q.neto?'$'+num(Math.round(q.neto/q.kg)):'—'),
       el('td',{},d===null?pill('g','—'):pill(d<0?'r':d<=7?'m':'g',d<0?Math.abs(d)+'d tarde':fdate(q.validez))),
       el('td',{class:'n'},nv?'r0–r'+q.rev:'—'),
+      el('td',{onclick:ev=>{ev.stopPropagation();UI.openCot=q.qid;UI.docTab='pdf';render();},
+        style:'cursor:pointer',title:estadoDoc(q).pdf?'Ver el PDF':'Adjuntar el PDF'},
+        estadoDoc(q).pdf?pill('v','✓'):pill('r','—')),
       el('td',{onclick:ev=>ev.stopPropagation()},
         el('button',{class:'b xs'+(d!==null&&d<0&&VIVA(q)?' pri':''),onclick:()=>recotizar(q)},'Recotizar'),' ',
         el('button',{class:'b xs sutil',title:'Copiar a un folio nuevo',onclick:()=>duplicarCotizacion(q)},'Duplicar'))));
@@ -2517,7 +2574,7 @@ function tablaCotizaciones(p,c){
       vv.length+' viva(s) de '+qs.length),
     el('td',{class:'n',style:'font-weight:600;background:var(--panel2)'},money(vv.reduce((a,q)=>a+(q.neto||0),0))),
     el('td',{class:'n',style:'background:var(--panel2)'},num(vv.reduce((a,q)=>a+(q.kg||0),0))||'—'),
-    el('td',{colspan:'3',style:'background:var(--panel2)'},''))));
+    el('td',{colspan:'5',style:'background:var(--panel2)'},''))));
   w.append(t);
   const abierta=qs.find(q=>q.qid===UI.openCot);
   if(abierta)w.append(el('div',{style:'padding:var(--s3)'},docCotizacion(abierta)));
@@ -2781,6 +2838,7 @@ VIEWS.numeros=function(v){
     el('span',{class:'mi'},DIR?('carpeta '+DIR.name):'sin carpeta conectada'),
     el('button',{class:'b xs',onclick:()=>escanearArchivo().then(render)},'Reexaminar'),
     el('button',{class:'b xs pri',onclick:archivarTodas},'Archivar todas')));
+  const sinLineas=S.cotizaciones.filter(q=>estadoDoc(q).html&&!(q.lineas||[]).length).length;
   arc.append(el('div',{style:'padding:11px var(--s4);border-bottom:1px solid var(--linea);font-size:12.5px;color:var(--t2);line-height:1.7'},
     el('div',{},'Cada cotización deja tres rastros bajo la clave ',el('code',{style:'font-family:var(--m)'},'FOLIO_rN'),':'),
     el('div',{style:'font-family:var(--m);font-size:11.5px;color:var(--t3);margin-top:4px'},
@@ -2807,6 +2865,10 @@ VIEWS.numeros=function(v){
         el('button',{class:'b xs sutil',onclick:()=>descargarDoc(q)},'Descargar'))));
   });
   t2.append(tb2); tw2.append(t2); arc.append(tw2);
+  arc.append(el('div',{class:'bloqueo'},'⚠',
+    el('div',{},'Los archivos .html son una foto del momento en que se guardaron. ',
+      el('strong',{},'Si editaste una cotización después de archivarla, vuelve a apretar «Archivar todas»'),
+      ' o el documento de la carpeta va a mostrar los datos viejos.')));
   if(sinPdf)arc.append(el('div',{class:'bloqueo'},'⚠',
     el('div',{},sinPdf+' de '+est.length+' cotizaciones no tienen su PDF archivado. ',
       'Van a aparecer solas cuando el barrido de correo empiece a guardar los adjuntos que enviaste.')));
@@ -3007,6 +3069,9 @@ function pgProyecto(v,p){
   const venc=qs.filter(q=>VIVA(q)&&dias(q.validez)!==null&&dias(q.validez)<0);
   card.append(el('header',{},el('h3',{},'Cotizaciones'),el('span',{class:'co'},String(qs.length)),
     venc.length?pill('r',venc.length+' vencida'+(venc.length>1?'s':'')):null,
+    (()=>{const n=qs.filter(x=>estadoDoc(x).pdf).length;
+      return qs.length?el('span',{class:'mi',title:'PDF archivados en Cartera BB/cotizaciones_pdf'},
+        n+' de '+qs.length+' con PDF'):null;})(),
     el('span',{class:'sp'}),
     ultima?el('button',{class:'b pri',onclick:()=>recotizar(ultima)},'Recotizar '+folioRev(ultima)):null,
     el('button',{class:'b',onclick:()=>crearCotizacion(p.cuenta,p.pid)},'Nueva cotización'),
@@ -3059,6 +3124,49 @@ function pgProyecto(v,p){
   v.append(w);
 }
 
+/* ---------- el PDF real, el que salió al cliente ---------- */
+function panelPDF(q){
+  const k=claveDoc(q), tiene=estadoDoc(q).pdf;
+  const cont=el('div',{style:'padding:var(--s4)'});
+  const zona=el('div',{id:'zonaPDF',
+    style:'border:2px dashed var(--linea2);border-radius:var(--r2);background:var(--panel2);padding:var(--s4)'});
+  const inp=el('input',{type:'file',accept:'application/pdf,.pdf',style:'display:none'});
+  const soltar=async f=>{ if(await guardarPDF(q,f)){ await escanearArchivo(); render(); } };
+  inp.addEventListener('change',e=>soltar(e.target.files[0]));
+  ['dragenter','dragover'].forEach(ev=>zona.addEventListener(ev,e=>{e.preventDefault();
+    zona.style.borderColor='var(--acc)';zona.style.background='var(--acc-suave)';}));
+  ['dragleave','drop'].forEach(ev=>zona.addEventListener(ev,e=>{e.preventDefault();
+    zona.style.borderColor='var(--linea2)';zona.style.background='var(--panel2)';}));
+  zona.addEventListener('drop',e=>soltar(e.dataTransfer.files[0]));
+
+  if(!tiene){
+    zona.append(vacio(ICO.cotizar,'Todavía no está el PDF de esta cotización',
+      'Arrastra aquí el PDF que le enviaste al cliente y queda archivado como '+k+'.pdf en Cartera BB/cotizaciones_pdf. '+
+      'Si aún no lo generas, imprime el documento desde la pestaña Documento y guárdalo con ese nombre.',
+      el('button',{class:'b pri',onclick:()=>inp.click()},'Elegir el PDF'),inp,
+      el('button',{class:'b',onclick:()=>imprimirDoc(q)},'Imprimir el documento')));
+    cont.append(zona);
+    cont.append(el('div',{class:'mi',style:'margin-top:var(--s3);line-height:1.6'},
+      'Cuando el barrido de correo esté andando, los PDF que ya enviaste van a aparecer aquí solos: el flujo guarda cada adjunto que traiga el folio en el nombre.'));
+    return cont;
+  }
+  const marco=el('iframe',{id:'visorPDF',
+    style:'width:100%;height:min(78vh,900px);border:1px solid var(--linea);border-radius:var(--r);background:#fff;display:block'});
+  urlPDF(q).then(u=>{ const m=document.getElementById('visorPDF'); if(m&&u)m.src=u; });
+  cont.append(el('div',{style:'display:flex;gap:7px;align-items:center;margin-bottom:var(--s3);flex-wrap:wrap'},
+    pill('v','archivado'),el('span',{class:'mi num'},'cotizaciones_pdf/'+k+'.pdf'),
+    el('span',{style:'flex:1'}),
+    el('button',{class:'b xs',onclick:()=>urlPDF(q).then(u=>{if(u)window.open(u,'_blank');})},'Abrir aparte'),
+    el('button',{class:'b xs',onclick:()=>inp.click()},'Reemplazar'),inp,
+    el('button',{class:'b xs sutil peli',onclick:()=>borrarPDF(q)},'Borrar')),
+    marco,
+    el('div',{class:'mi',style:'margin-top:var(--s2)'},
+      'Para reemplazarlo también puedes arrastrar el archivo nuevo sobre el visor.'));
+  ['dragenter','dragover'].forEach(ev=>cont.addEventListener(ev,e=>e.preventDefault()));
+  cont.addEventListener('drop',e=>{e.preventDefault();soltar(e.dataTransfer.files[0]);});
+  return cont;
+}
+
 /* ============================================================
    LA COTIZACIÓN COMO DOCUMENTO
    Todo lo que sale en el PDF, en pantalla y editable en el sitio.
@@ -3072,19 +3180,23 @@ function docCotizacion(q){
 
   const barra=el('div',{class:'barra-doc'});
   barra.append(el('div',{class:'grupo'},
-    ...[['doc','Documento'],['proceso','Proceso'],['revs','Revisiones']].map(([k,l])=>
+    ...[['doc','Documento'],['pdf','PDF'],['proceso','Proceso'],['revs','Revisiones']].map(([k,l])=>
       el('button',{'aria-current':(UI.docTab||'doc')===k?'true':'false',
         onclick:()=>{UI.docTab=k;render();}},l,
-        k==='revs'&&(q.versiones||[]).length?el('span',{style:'font-family:var(--m);font-size:10px;opacity:.6;margin-left:5px'},String(q.versiones.length)):null))),
+        k==='revs'&&(q.versiones||[]).length?el('span',{style:'font-family:var(--m);font-size:10px;opacity:.6;margin-left:5px'},String(q.versiones.length)):null,
+        k==='pdf'?el('span',{style:'margin-left:5px;font-size:10px'},estadoDoc(q).pdf?'✓':'—'):null))),
     el('span',{class:'sp',style:'flex:1'}),
     (()=>{const a=estadoDoc(q);
       return el('span',{class:'mi',style:'display:flex;gap:6px;align-items:center',
         title:'Archivos en Cartera BB con la clave '+claveDoc(q)},
         el('span',{},'Archivo:'),
         pill(a.json?'v':'g','JSON'),pill(a.html?'v':'g','HTML'),
-        pill(a.pdf?'v':'r','PDF'),a.cotizador?pill('a','cotizador'):null);})(),
+        el('button',{onclick:()=>{UI.docTab='pdf';render();},title:a.pdf?'Ver el PDF archivado':'Adjuntar el PDF'},
+          pill(a.pdf?'v':'r','PDF')),
+        a.cotizador?pill('a','cotizador'):null);})(),
     el('button',{class:'b xs',onclick:()=>archivarCotizacion(q).then(render)},'Guardar en carpeta'),
-    el('button',{class:'b xs',onclick:()=>window.print(),title:'Imprimir o guardar como PDF'},'Imprimir'),
+    el('button',{class:'b xs',onclick:()=>imprimirDoc(q),title:'Abre el documento limpio e imprime'},'Imprimir'),
+    el('button',{class:'b xs sutil',onclick:()=>verDocAparte(q),title:'Ver el documento en otra pestaña'},'Ver aparte'),
     el('button',{class:'b xs',onclick:()=>abrirCotizador({cuenta:q.cuenta,proyecto:q.proyecto,qid:q.qid})},'Abrir en el cotizador'),
     el('button',{class:'b xs pri',onclick:()=>recotizar(q)},'Recotizar'),
     el('button',{class:'b xs',onclick:()=>duplicarCotizacion(q)},'Duplicar'),
@@ -3092,6 +3204,7 @@ function docCotizacion(q){
   w.append(barra);
 
   const tab=UI.docTab||'doc';
+  if(tab==='pdf'){ w.append(panelPDF(q)); return w; }
   if(tab==='proceso'){
     w.append(via(q));
     if(q.estado==='Adjudicada')w.append(viaEjecucion(q),bloqueRequisitos(q));
