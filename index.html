@@ -412,6 +412,29 @@ const REQ_INGRESO=[
   {k:'segmento',t:'Segmento',a:'Clasificación comercial del pedido',tipo:'lista',opciones:['HAB','SOC','INFR','MIX','MIN','OTRO']},
   {k:'camiones',t:'Camiones y flete',a:'Cantidad, tipo y valor de cada flete',tipo:'texto'}
 ];
+const IVA=0.19;
+const COND_DEF={
+  plazoEntrega:'20 días hábiles desde recibida la OC',
+  condPago:'A través de línea de crédito',
+  moneda:'Peso chileno (CLP), valores netos',
+  cuadroCub:'',
+  reajuste:'Forma trimestral, de acuerdo a lista de precios de fábrica',
+  lugarEntrega:'Puesto en obra. Descarga por cuenta del cliente.',
+  validezTexto:'',
+  anticipo:'No aplica',
+  facturacion:'A 30 días según guía de despacho (GD)',
+  despachoMin:'A convenir, en camiones completos de 20 ton según avance y secuencia constructiva',
+  notaTecnica:'',
+  glosa:''
+};
+const CAMPOS_COND=[
+  ['plazoEntrega','Plazo de entrega'],['condPago','Condición de pago'],['moneda','Moneda'],
+  ['cuadroCub','Cuadro de cubicación N°']
+];
+const CAMPOS_GRAL=[
+  ['reajuste','Reajuste'],['lugarEntrega','Lugar de entrega'],['validezTexto','Validez de la oferta'],
+  ['anticipo','Anticipo'],['facturacion','Facturación'],['despachoMin','Despacho mínimo']
+];
 const EST_PROY=['En estudio','Activo','Suspendido','Cerrado','Perdido'];
 const FAMILIAS=['Malla electrosoldada','Barra / fierro','Alambre','Perfilería steel framing','Cerco Acmanet','Flete','Otro'];
 const VIVA=c=>!['Adjudicada','Perdida','Reemplazada'].includes(c.estado);
@@ -423,7 +446,7 @@ let S=null, saveT=null, UNDO=[], UI={
   q:'', sortC:{key:'venc',dir:1}, sortA:{key:'urg',dir:1},
   fA:{prio:'',canal:'',seg:'',txt:'',arch:false}, fQ:{estado:'',txt:''},
   cols:null, sel:new Set(), dtab:'resumen', openProy:null, openCot:null,
-  editFicha:false, abrirReq:null, verCheck:null};
+  editFicha:false, abrirReq:null, verCheck:null, docTab:'doc'};
 const COLS=[['prio','Prioridad'],['seg','Segmento'],['canal','Estado del canal'],['sc','Sin contacto'],
   ['nq','Cotizaciones'],['vivo','Monto vivo'],['tar','Tareas'],['prox','Próximo paso'],['acc','Acciones']];
 
@@ -470,6 +493,21 @@ const enEjecucion=q=>q.estado==='Adjudicada';
 function faltaIngreso(q){ return REQ_INGRESO.filter(r=>{const v=q.ingreso?.[r.k];
   return v===''||v===null||v===undefined;}); }
 function avanceEjec(q){ const i=EJEC.indexOf(q.ejecucion); return i<0?-1:i; }
+/* Cuánto lleva parado en la etapa actual. Es la señal más predictiva de un
+   pedido que se va a caer, y hasta ahora el panel no la medía. */
+const TOPE_ETAPA={'OC recibida':2,'Ingresada a coordinación':3,'Programada':10,'En despacho':5,'Entregada':30,'Facturada':0};
+function diasEnEtapa(q){
+  const i=avanceEjec(q); if(i<0)return null;
+  const f=q.hitos?.[HITO[EJEC[i]]]; const d=pd(f);
+  if(!d)return null; return Math.round((HOY-d)/864e5);
+}
+function trabado(q){
+  const i=avanceEjec(q); if(i<0)return false;
+  if(q.ejecucion==='Facturada')return false;
+  if(i<EJEC.indexOf('Ingresada a coordinación')&&faltaIngreso(q).length)return true;
+  const d=diasEnEtapa(q); const tope=TOPE_ETAPA[q.ejecucion];
+  return d!==null&&tope&&d>tope;
+}
 async function setEjecucion(q,e){
   if(e===q.ejecucion)return;
   const iNuevo=EJEC.indexOf(e);
@@ -538,6 +576,7 @@ function migrar(st){
   st.version=4;
   st.tareas=st.tareas||[];
   st.proyectos=st.proyectos||[];
+  st.proyectos.forEach(p=>{ if(p.lat===undefined)p.lat=''; if(p.lng===undefined)p.lng=''; });
   st.cuentas=st.cuentas||[];
   st.cuentas.forEach(c=>{
     if(!c.cid)c.cid=uid();
@@ -554,6 +593,10 @@ function migrar(st){
     if(q.rev===undefined)q.rev=0;
     if(!q.versiones)q.versiones=[];
     if(q.ejecucion===undefined)q.ejecucion='';
+    if(!q.cond)q.cond=JSON.parse(JSON.stringify(COND_DEF));
+    else Object.keys(COND_DEF).forEach(k=>{ if(q.cond[k]===undefined)q.cond[k]=COND_DEF[k]; });
+    if(q.rut===undefined)q.rut='';
+    if(q.emailContacto===undefined)q.emailContacto=q.email||'';
     if(!q.hitos)q.hitos={oc:'',ingreso:'',programa:'',despacho:'',entrega:'',factura:''};
     if(!q.ingreso)q.ingreso={calendario:'',precioKilo:null,direccion:'',contactoObra:'',segmento:'',camiones:''};
     if(!q.incidencias)q.incidencias=[];
@@ -561,12 +604,67 @@ function migrar(st){
     const nom=(q.obra||'Obra sin definir').trim();
     let p=st.proyectos.find(x=>x.cuenta===q.cuenta&&norm(x.nombre)===norm(nom));
     if(!p){ p={pid:uid(),cuenta:q.cuenta,nombre:nom,comuna:'',direccion:'',mandante:'',
-      estado:'Activo',inicio:'',notas:''}; st.proyectos.push(p); }
+      estado:'Activo',inicio:'',notas:'',lat:'',lng:''}; st.proyectos.push(p); }
     q.proyecto=p.pid;
   });
   (st.bitacora||[]).forEach(b=>{ if(!b.id)b.id=uid(); });
   return st;
 }
+
+
+/* ============================================================
+   COORDENADAS DE COMUNAS
+   Centroides aproximados, suficientes para ubicar una obra en el mapa.
+   Si necesitas precisión de dirección, el proyecto acepta lat/lng propias.
+   ============================================================ */
+const COMUNAS={
+'santiago':[-33.4489,-70.6693],'las condes':[-33.4086,-70.5673],'providencia':[-33.4262,-70.6110],
+'vitacura':[-33.3897,-70.5760],'lo barnechea':[-33.3506,-70.5180],'nunoa':[-33.4569,-70.5975],
+'la reina':[-33.4450,-70.5400],'penalolen':[-33.4890,-70.5400],'macul':[-33.4870,-70.5980],
+'san joaquin':[-33.4950,-70.6280],'la florida':[-33.5220,-70.5990],'puente alto':[-33.6110,-70.5760],
+'pirque':[-33.6400,-70.5500],'san bernardo':[-33.5920,-70.7000],'el bosque':[-33.5620,-70.6750],
+'la cisterna':[-33.5340,-70.6640],'san ramon':[-33.5390,-70.6440],'la granja':[-33.5390,-70.6240],
+'la pintana':[-33.5830,-70.6300],'maipu':[-33.5110,-70.7580],'cerrillos':[-33.4950,-70.7130],
+'estacion central':[-33.4600,-70.6900],'pedro aguirre cerda':[-33.4870,-70.6720],'lo espejo':[-33.5220,-70.6890],
+'quinta normal':[-33.4270,-70.7000],'lo prado':[-33.4440,-70.7250],'pudahuel':[-33.4400,-70.7530],
+'cerro navia':[-33.4230,-70.7370],'renca':[-33.4030,-70.7280],'quilicura':[-33.3630,-70.7290],
+'conchali':[-33.3830,-70.6750],'huechuraba':[-33.3700,-70.6400],'independencia':[-33.4150,-70.6640],
+'recoleta':[-33.4100,-70.6400],'colina':[-33.2010,-70.6740],'lampa':[-33.2840,-70.8770],
+'til til':[-33.0870,-70.9300],'buin':[-33.7330,-70.7420],'paine':[-33.8080,-70.7440],
+'melipilla':[-33.6880,-71.2150],'talagante':[-33.6640,-70.9280],'penaflor':[-33.6100,-70.8790],
+'padre hurtado':[-33.5720,-70.8160],'isla de maipo':[-33.7530,-70.9010],'el monte':[-33.6790,-70.9830],
+'curacavi':[-33.4020,-71.1440],'maria pinto':[-33.5230,-71.1360],'san jose de maipo':[-33.6400,-70.3520],
+'calera de tango':[-33.6280,-70.7770],'gran santiago':[-33.4489,-70.6693],'santiago centro':[-33.4489,-70.6693],
+'arica':[-18.4783,-70.3126],'iquique':[-20.2307,-70.1357],'alto hospicio':[-20.2500,-70.1050],
+'antofagasta':[-23.6509,-70.3975],'calama':[-22.4544,-68.9294],'mejillones':[-23.0990,-70.4490],
+'copiapo':[-27.3668,-70.3314],'diego de almagro':[-26.3900,-70.0500],'vallenar':[-28.5760,-70.7590],
+'caldera':[-27.0670,-70.8250],'la serena':[-29.9027,-71.2519],'coquimbo':[-29.9533,-71.3436],
+'ovalle':[-30.5983,-71.1993],'illapel':[-31.6330,-71.1670],'valparaiso':[-33.0472,-71.6127],
+'vina del mar':[-33.0245,-71.5518],'quilpue':[-33.0472,-71.4420],'villa alemana':[-33.0423,-71.3733],
+'concon':[-32.9200,-71.5170],'quillota':[-32.8800,-71.2470],'la calera':[-32.7870,-71.2050],
+'san antonio':[-33.5930,-71.6210],'cartagena':[-33.5450,-71.6060],'el quisco':[-33.3980,-71.6930],
+'algarrobo':[-33.3650,-71.6690],'santo domingo':[-33.6350,-71.6300],'los andes':[-32.8340,-70.5980],
+'san felipe':[-32.7500,-70.7250],'rancagua':[-34.1708,-70.7444],'machali':[-34.1810,-70.6490],
+'requinoa':[-34.2800,-70.8180],'rengo':[-34.4060,-70.8600],'san fernando':[-34.5860,-70.9890],
+'santa cruz':[-34.6390,-71.3660],'pichilemu':[-34.3870,-72.0000],'curico':[-34.9828,-71.2394],
+'talca':[-35.4264,-71.6554],'linares':[-35.8460,-71.5930],'constitucion':[-35.3330,-72.4160],
+'cauquenes':[-35.9670,-72.3170],'chillan':[-36.6066,-72.1034],'concepcion':[-36.8270,-73.0503],
+'talcahuano':[-36.7249,-73.1168],'san pedro de la paz':[-36.8420,-73.1050],'hualpen':[-36.7930,-73.1060],
+'chiguayante':[-36.9260,-73.0290],'coronel':[-37.0280,-73.1360],'lota':[-37.0900,-73.1570],
+'los angeles':[-37.4697,-72.3536],'temuco':[-38.7359,-72.5904],'padre las casas':[-38.7660,-72.5960],
+'villarrica':[-39.2860,-72.2280],'pucon':[-39.2820,-71.9550],'angol':[-37.7950,-72.7160],
+'valdivia':[-39.8142,-73.2459],'osorno':[-40.5745,-73.1350],'puerto montt':[-41.4693,-72.9424],
+'puerto varas':[-41.3195,-72.9854],'castro':[-42.4826,-73.7626],'ancud':[-41.8710,-73.8280],
+'coyhaique':[-45.5712,-72.0685],'punta arenas':[-53.1638,-70.9171],'puerto natales':[-51.7290,-72.5060]
+};
+function coordDe(p){
+  if(p.lat&&p.lng)return [Number(p.lat),Number(p.lng)];
+  const k=norm(p.comuna||'').replace(/\s+/g,' ').trim();
+  if(COMUNAS[k])return COMUNAS[k];
+  for(const c in COMUNAS){ if(k&&(k.includes(c)||c.includes(k))&&c.length>4)return COMUNAS[c]; }
+  return null;
+}
+const COMUNAS_LISTA=Object.keys(COMUNAS).sort();
 
 /* ============ diálogos ============ */
 function toast(t,accion){ document.querySelectorAll('.aviso').forEach(n=>n.remove());
@@ -790,7 +888,7 @@ async function crearCotizacion(cn,pid){
     const c=cuenta(r.cuenta);
     const q={qid:uid(),folio:r.folio.trim(),rev:0,versiones:[],fecha:iso(HOY),cuenta:r.cuenta,proyecto:pr.pid,
       obra:r.alcance||pr.nombre,contacto:c?.contacto||'',email:c?.email||'',producto:'',neto:0,kg:null,
-      validez:r.validez,estado:r.estado,prob:null,probManual:false,oc:'',nota:'',cierre:'',motivoPerdida:'',lineas:[]};
+      validez:r.validez,estado:r.estado,prob:null,probManual:false,oc:'',nota:'',cierre:'',motivoPerdida:'',lineas:[],cond:JSON.parse(JSON.stringify(COND_DEF)),rut:'',emailContacto:c?.email||''};
     S.cotizaciones.unshift(q);
     logB(r.cuenta,'cotizacion','Creada '+q.folio+' — '+pr.nombre+(r.alcance?' / '+r.alcance:''));
     UI.dtab='proyectos'; UI.openProy=pr.pid;
@@ -817,7 +915,7 @@ async function crearProyecto(cn){
   let nuevo=null;
   mut('crear proyecto',()=>{
     nuevo={pid:uid(),cuenta:r.cuenta,nombre:r.nombre.trim(),comuna:r.comuna,direccion:r.direccion,
-      mandante:r.mandante,estado:r.estado,inicio:'',notas:''};
+      mandante:r.mandante,estado:r.estado,inicio:'',notas:'',lat:'',lng:''};
     S.proyectos.push(nuevo);
     logB(r.cuenta,'nota','Nuevo proyecto: '+nuevo.nombre);
     UI.dtab='proyectos'; UI.openProy=nuevo.pid;
@@ -970,11 +1068,12 @@ function importarLibro(buf){
   if(PR){ const hp=hdrRow(PR,['Cuenta','Proyecto']);
     if(hp>=0){ const P=PR[hp],g5=(...n)=>colIdx(P,...n);
       const mp={cuenta:g5('Cuenta'),nombre:g5('Proyecto'),comuna:g5('Comuna'),direccion:g5('Dirección'),
-        mandante:g5('Mandante'),estado:g5('Estado'),inicio:g5('Inicio'),notas:g5('Notas')};
+        mandante:g5('Mandante'),estado:g5('Estado'),inicio:g5('Inicio'),notas:g5('Notas'),lat:g5('Lat'),lng:g5('Lng')};
       for(let i=hp+1;i<PR.length;i++){const r=PR[i]||[];if(!celTxt(r[mp.nombre]))continue;
         proyectos.push({pid:uid(),cuenta:celTxt(r[mp.cuenta]),nombre:celTxt(r[mp.nombre]),comuna:celTxt(r[mp.comuna]),
           direccion:celTxt(r[mp.direccion]),mandante:celTxt(r[mp.mandante]),estado:celTxt(r[mp.estado])||'Activo',
-          inicio:celFecha(r[mp.inicio]),notas:celTxt(r[mp.notas])});}}}
+          inicio:celFecha(r[mp.inicio]),notas:celTxt(r[mp.notas]),
+          lat:mp.lat>=0?celTxt(r[mp.lat]):'',lng:mp.lng>=0?celTxt(r[mp.lng]):''});}}}
   cots.forEach(q=>{ if(!q._proyNom)return;
     const p=proyectos.find(x=>x.cuenta===q.cuenta&&norm(x.nombre)===norm(q._proyNom));
     if(p)q.proyecto=p.pid; delete q._proyNom; });
@@ -1007,7 +1106,7 @@ function xlsxBlob(){
   hoja('PROYECTOS',[['Cuenta',p=>p.cuenta],['Proyecto',p=>p.nombre],['Comuna',p=>p.comuna],['Dirección',p=>p.direccion],
     ['Mandante',p=>p.mandante],['Estado',p=>p.estado],['Inicio',p=>p.inicio],
     ['Cotizaciones',p=>cotsDeProy(p.pid).length],['Monto vivo',p=>cotsDeProy(p.pid).filter(VIVA).reduce((a,q)=>a+(q.neto||0),0)],
-    ['Notas',p=>p.notas]],S.proyectos);
+    ['Lat',p=>p.lat||''],['Lng',p=>p.lng||''],['Notas',p=>p.notas]],S.proyectos);
   hoja('COTIZACIONES',[['Folio',q=>q.folio],['Rev',q=>q.rev||0],['Proyecto',q=>proyecto(q.proyecto)?.nombre||''],
     ['Fecha emisión',q=>q.fecha],['Cuenta',q=>q.cuenta],['Obra / alcance',q=>q.obra],
     ['Contacto',q=>q.contacto],['Email',q=>q.email],['Producto',q=>q.producto],['Total neto',q=>q.neto],['kg',q=>q.kg||''],
@@ -1016,6 +1115,9 @@ function xlsxBlob(){
     ['Motivo pérdida',q=>q.motivoPerdida],['Ejecución',q=>q.ejecucion||''],
     ['Fecha OC',q=>q.hitos?.oc||''],['Ingresada',q=>q.hitos?.ingreso||''],['Programada',q=>q.hitos?.programa||''],
     ['Despacho',q=>q.hitos?.despacho||''],['Entregada',q=>q.hitos?.entrega||''],['Facturada',q=>q.hitos?.factura||''],
+    ['Plazo de entrega',q=>q.cond?.plazoEntrega||''],['Condición de pago',q=>q.cond?.condPago||''],
+    ['Lugar de entrega',q=>q.cond?.lugarEntrega||''],['Cuadro de cubicación',q=>q.cond?.cuadroCub||''],
+    ['Nota técnica',q=>q.cond?.notaTecnica||''],
     ['Precio/kilo OC',q=>q.ingreso?.precioKilo||''],['Dirección obra',q=>q.ingreso?.direccion||''],
     ['Contacto obra',q=>q.ingreso?.contactoObra||''],['Camiones',q=>q.ingreso?.camiones||''],
     ['Qué falta / nota',q=>q.nota]],S.cotizaciones);
@@ -1040,6 +1142,139 @@ function descargarRespaldo(){
   const b=xlsxBlob(); if(!b){toast('El lector de Excel no cargó');return;}
   const a=el('a',{href:URL.createObjectURL(b),download:'cartera_acma_'+iso(HOY)+'.xlsx'});
   document.body.append(a);a.click();a.remove();toast('Descargado');
+}
+
+/* ============================================================
+   ARCHIVO DOCUMENTAL
+   Una sola convención para todo: FOLIO_rN. Cada cotización deja
+   sus rastros bajo Cartera BB:
+     cotizaciones/BB2026-016_r0.json           datos del CRM
+     cotizaciones/BB2026-016_r0.html           documento imprimible
+     cotizaciones/BB2026-016_r0.cotizador.json snapshot del cotizador
+     cotizaciones_pdf/BB2026-016_r0.pdf        el PDF que salió al cliente
+   El último lo pone el barrido de correo; los demás, el panel.
+   ============================================================ */
+const D_COT='cotizaciones', D_PDF='cotizaciones_pdf', D_MAIL='correos';
+const claveDoc=q=>String(q.folio).replace(/[^\w\-]/g,'_')+'_r'+(q.rev||0);
+let ARCHIVO={};
+
+async function subcarpeta(nombre,crear){
+  if(!DIR)return null;
+  try{ return await DIR.getDirectoryHandle(nombre,{create:!!crear}); }catch(e){ return null; }
+}
+async function escanearArchivo(){
+  ARCHIVO={};
+  if(!DIR)return ARCHIVO;
+  const marcar=nom=>{ const m=String(nom).match(/^(.+?)(\.cotizador)?\.(json|html|pdf)$/i); if(!m)return;
+    const k=m[1]; if(!ARCHIVO[k])ARCHIVO[k]={};
+    if(m[2])ARCHIVO[k].cotizador=true; else ARCHIVO[k][m[3].toLowerCase()]=true; };
+  for(const carp of [D_COT,D_PDF]){
+    const h=await subcarpeta(carp,false); if(!h)continue;
+    try{ for await(const [nom,ent] of h.entries()){ if(ent.kind==='file')marcar(nom); } }catch(e){}
+  }
+  return ARCHIVO;
+}
+const estadoDoc=q=>ARCHIVO[claveDoc(q)]||{};
+
+async function escribirEn(carpeta,nombre,blob){
+  const h=await subcarpeta(carpeta,true); if(!h)throw new Error('sin carpeta');
+  const fh=await h.getFileHandle(nombre,{create:true});
+  const w=await fh.createWritable(); await w.write(blob); await w.close();
+}
+
+/* el documento como archivo autocontenido: se abre y se imprime en cualquier parte */
+function htmlCotizacion(q){
+  const p=proyecto(q.proyecto),c=cuenta(q.cuenta),cond=q.cond||{};
+  const neto=q.neto||0, iva=Math.round(neto*IVA);
+  const kgTot=(q.lineas||[]).reduce((a,l)=>a+(Number(l.kg)||0),0);
+  const e=s=>String(s??'').replace(/[&<>"]/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[x]));
+  const fila=l=>{const t=(Number(l.kg)||0)*(Number(l.precioKg)||0)+(Number(l.monto)||0);
+    return '<tr><td class=c>'+e(l.familia||'')+'</td><td>'+e(l.producto||'')+'</td>'+
+      '<td class=n>'+(l.kg?num(l.kg):'')+'</td><td class=n>'+(l.precioKg?'$'+num(l.precioKg):'')+'</td>'+
+      '<td class=n>$'+num(t)+'</td></tr>';};
+  const par=(k,v)=>'<tr><th>'+e(k)+'</th><td>'+e(v||'—')+'</td></tr>';
+  const est=[
+    '*{box-sizing:border-box}body{margin:0;padding:22px;font:13px/1.5 Arial,Helvetica,sans-serif;color:#0F1419;background:#F1F3F6}',
+    '.h{max-width:900px;margin:0 auto;background:#fff;border:1px solid #E2E6EB}',
+    '.top{height:9px;background:linear-gradient(90deg,#0E2841 0 72%,#E3A008 72% 100%)}',
+    '.enc{display:flex;justify-content:space-between;padding:18px 26px 12px}',
+    '.mk{font-size:24px;font-weight:700;color:#0E2841}.mk small{display:block;font-size:10px;font-weight:400;color:#8A94A2;margin-top:2px}',
+    '.nd{text-align:right}.nd .t{font-size:18px;font-weight:600;color:#1E5EA8}',
+    '.nd .f{font-family:monospace;font-size:17px;font-weight:600;background:#FCF3DF;padding:2px 10px;display:inline-block;margin-top:3px}',
+    '.nd .r{font-size:11px;color:#8A94A2;margin-top:3px}',
+    '.cols{display:flex;gap:26px;padding:0 26px 14px}.cols>div{flex:1;min-width:0}',
+    'h4{margin:0 0 6px;font-size:10px;font-weight:700;color:#1E5EA8;letter-spacing:.06em;text-transform:uppercase;border-bottom:2px solid #1E5EA8;padding-bottom:4px}',
+    'table.p{width:100%;border-collapse:collapse;font-size:12px}',
+    'table.p th{text-align:left;font-size:10.5px;color:#8A94A2;font-weight:500;padding:4px 8px 4px 0;width:120px;vertical-align:top}',
+    'table.p td{padding:4px 0;border-bottom:1px solid #E2E6EB;vertical-align:top}',
+    '.gl{padding:4px 26px 14px;font-size:12.5px}',
+    'table.d{border-collapse:collapse;font-size:11.5px;margin:0 26px;width:calc(100% - 52px)}',
+    'table.d th{background:#0E2841;color:#fff;font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;padding:7px 9px;text-align:left}',
+    'table.d th.n,table.d td.n{text-align:right}table.d td{padding:6px 9px;border-bottom:1px solid #E2E6EB}',
+    'table.d tbody tr:nth-child(odd) td{background:#FDF8F0}table.d td.c{font-family:monospace;font-size:10.5px;font-weight:600;color:#1E5EA8}',
+    '.nt{padding:12px 26px 0;font-size:10px;line-height:1.5;color:#48525F}',
+    '.tt{display:flex;justify-content:flex-end;padding:16px 26px}',
+    '.tt table{border-collapse:collapse;min-width:290px;font-size:12.5px}',
+    '.tt td{padding:6px 12px;border-bottom:1px solid #E2E6EB}.tt td.v{text-align:right;font-family:monospace;font-weight:600}',
+    '.tt tr.g td{background:#0E2841;color:#fff;font-size:14px;border:0}',
+    '.gr{padding:0 26px 22px}.fi{display:flex;justify-content:space-between;padding:16px 26px 24px;border-top:1px solid #E2E6EB}',
+    '.fn{font-size:14px;font-weight:600}.fc{font-size:11px;color:#48525F}',
+    '@media print{body{background:#fff;padding:0}.h{border:0}}'].join('');
+  return '<!doctype html><html lang=es><meta charset=utf-8><title>'+e(folioRev(q))+' · '+e(q.cuenta)+'</title>'+
+  '<style>'+est+'</style>'+
+  '<div class=h><div class=top></div>'+
+  '<div class=enc><div class=mk>ACMA<small>ACMA S.A. · RUT 92.190.000-7 · Maruri 1942, Renca</small></div>'+
+  '<div class=nd><div class=t>COTIZACIÓN</div><div class=f>'+e(q.folio)+'</div><div class=r>Revisión '+(q.rev||0)+'</div></div></div>'+
+  '<div class=cols><div><h4>Cliente</h4><table class=p>'+
+    par('Cliente',c?c.nombre:q.cuenta)+par('RUT',q.rut)+par('Contacto',q.contacto)+par('Email',q.emailContacto)+
+    par('Obra / Proyecto',p?p.nombre:q.obra)+par('Comuna',p?p.comuna:'')+'</table></div>'+
+  '<div><h4>Condiciones comerciales</h4><table class=p>'+
+    par('Fecha de emisión',fdate(q.fecha))+par('Válida hasta (OC)',fdate(q.validez))+
+    CAMPOS_COND.map(function(x){return par(x[1],cond[x[0]]);}).join('')+'</table></div></div>'+
+  '<div class=gl>A continuación, cotizamos a ustedes el material solicitado: '+e(q.obra)+'</div>'+
+  '<table class=d><thead><tr><th style="width:120px">Código</th><th>Descripción</th>'+
+    '<th class=n style="width:96px">Peso total (kg)</th><th class=n style="width:80px">Valor kg</th>'+
+    '<th class=n style="width:110px">Valor total</th></tr></thead><tbody>'+
+    ((q.lineas||[]).map(fila).join('')||'<tr><td colspan=5 style="padding:18px;text-align:center;color:#8A94A2">Sin detalle cargado</td></tr>')+
+    '</tbody></table>'+
+  (cond.notaTecnica?'<div class=nt><b>NOTA TÉCNICA:</b> '+e(cond.notaTecnica)+'</div>':'')+
+  '<div class=tt><table><tr><td>Total neto</td><td class=v>$'+num(neto)+'</td></tr>'+
+    '<tr><td>IVA 19%</td><td class=v>$'+num(iva)+'</td></tr>'+
+    '<tr class=g><td>TOTAL</td><td class=v>$'+num(neto+iva)+'</td></tr></table></div>'+
+  '<div class=gr><h4>Condiciones generales</h4><table class=p>'+
+    CAMPOS_GRAL.map(function(x){return par(x[1],cond[x[0]]);}).join('')+'</table></div>'+
+  '<div class=fi><div style="font-size:10.5px;color:#8A94A2">'+
+    (kgTot?'Peso total del detalle: '+num(kgTot)+' kg'+(neto?' · precio medio $'+num(Math.round(neto/kgTot))+'/kg':''):'')+
+    (q.oc?'<br>Orden de compra: '+e(q.oc):'')+'</div>'+
+  '<div style="text-align:right"><div class=fn>Benjamín Bittelman</div>'+
+    '<div class=fc>Key Account Manager · ACMA S.A.</div>'+
+    '<div class=fc>bbittelman@acma.cl · +56 9 8360 8787</div></div></div></div></html>';
+}
+
+async function archivarCotizacion(q,silencio){
+  if(!DIR){ if(!silencio)toast('No hay carpeta conectada'); return false; }
+  const k=claveDoc(q);
+  try{
+    const datos={version:1,exportado:iso(HOY),cuenta:q.cuenta,
+      proyecto:(proyecto(q.proyecto)||{}).nombre||'',cotizacion:JSON.parse(JSON.stringify(q))};
+    await escribirEn(D_COT,k+'.json',new Blob([JSON.stringify(datos,null,1)],{type:'application/json'}));
+    await escribirEn(D_COT,k+'.html',new Blob([htmlCotizacion(q)],{type:'text/html;charset=utf-8'}));
+    ARCHIVO[k]=Object.assign(ARCHIVO[k]||{},{json:true,html:true});
+    if(!silencio)toast(k+' archivada en JSON y HTML');
+    return true;
+  }catch(e){ if(!silencio)toast('No se pudo escribir en la carpeta'); return false; }
+}
+async function archivarTodas(){
+  if(!DIR){ toast('No hay carpeta conectada'); return; }
+  let n=0;
+  for(const q of S.cotizaciones){ if(await archivarCotizacion(q,true))n++; }
+  await escanearArchivo(); render();
+  toast(n+' cotizaciones archivadas en cotizaciones/ (JSON + HTML)');
+}
+function descargarDoc(q){
+  const b=new Blob([htmlCotizacion(q)],{type:'text/html;charset=utf-8'});
+  const a=el('a',{href:URL.createObjectURL(b),download:claveDoc(q)+'.html'});
+  document.body.append(a);a.click();a.remove();
 }
 
 /* ---- DASHBOARD ---- */
@@ -1268,13 +1503,14 @@ const svgIco=(d,s=19)=>{const n=document.createElementNS('http://www.w3.org/2000
 const SECCIONES=[['hoy','Hoy'],['cartera','Cartera'],['numeros','Números'],['cotizar','Cotizar']];
 
 function irA(ruta,reemplazar){
-  const h=ruta.v==='cuenta'?('#/cuenta/'+encodeURIComponent(ruta.id)):('#/'+ruta.v);
+  const h=(ruta.v==='cuenta'||ruta.v==='proyecto')?('#/'+ruta.v+'/'+encodeURIComponent(ruta.id)):('#/'+ruta.v);
   if(location.hash===h){UI.ruta=ruta;render();return;}
   if(reemplazar)location.replace(h); else location.hash=h;
 }
 function leerRuta(){
   const h=(location.hash||'#/hoy').replace(/^#\/?/,'').split('/');
   if(h[0]==='cuenta'&&h[1])return {v:'cuenta',id:decodeURIComponent(h[1])};
+  if(h[0]==='proyecto'&&h[1])return {v:'proyecto',id:decodeURIComponent(h[1])};
   const v=['hoy','cartera','numeros','cotizar'].includes(h[0])?h[0]:'hoy';
   return {v};
 }
@@ -1291,6 +1527,7 @@ function render(){
   if(!S){ vPuerta(v); return; }
   const r=UI.ruta;
   if(r.v==='cuenta'){ const c=cuenta(r.id); if(!c){ irA({v:'cartera'},true); return; } pgCuenta(v,c); }
+  else if(r.v==='proyecto'){ const p=proyecto(r.id); if(!p){ irA({v:'cartera'},true); return; } pgProyecto(v,p); }
   else (VIEWS[r.v]||VIEWS.hoy)(v);
   requestAnimationFrame(()=>{ try{ if(pos)v.scrollTop=pos; }catch(e){}
     const t2=document.querySelector('#view .tw'); if(t2&&posT)t2.scrollTop=posT; });
@@ -1301,7 +1538,7 @@ function pintaRail(){
   n.append(el('div',{class:'marca',title:'Cartera ACMA'},'A'));
   if(!S)return;
   SECCIONES.forEach(([k,l])=>{
-    const activo=UI.ruta.v===k||(k==='cartera'&&UI.ruta.v==='cuenta');
+    const activo=UI.ruta.v===k||(k==='cartera'&&['cuenta','proyecto'].includes(UI.ruta.v));
     const b=el('button',{class:'nv','aria-current':activo?'page':'false','aria-label':l,onclick:()=>irA({v:k})});
     b.append(svgIco(ICO[k]),el('span',{class:'tip'},l));
     const c=insignia(k); if(c)b.append(el('span',{class:'badge'},String(c)));
@@ -1342,6 +1579,13 @@ function pintaBarra(){
       if(p){ mig.append(el('span',{class:'fl'},'›'),el('button',{onclick:()=>{UI.openCot=null;render();}},p.nombre));
         if(UI.openCot){ const q=S.cotizaciones.find(x=>x.qid===UI.openCot);
           if(q)mig.append(el('span',{class:'fl'},'›'),el('span',{style:'font-family:var(--m);font-size:12.5px'},folioRev(q))); } } }
+  }else if(r.v==='proyecto'){
+    const p=proyecto(r.id);
+    mig.append(el('button',{onclick:()=>irA({v:'cartera'})},'Cartera'),el('span',{class:'fl'},'›'),
+      el('button',{onclick:()=>abrir(p?p.cuenta:'')},p?p.cuenta:'—'),el('span',{class:'fl'},'›'),
+      el('span',{class:'actual'},p?p.nombre:r.id));
+    if(UI.openCot){ const q=S.cotizaciones.find(x=>x.qid===UI.openCot);
+      if(q)mig.append(el('span',{class:'fl'},'›'),el('span',{style:'font-family:var(--m);font-size:12.5px'},folioRev(q))); }
   }else{
     mig.append(el('span',{class:'actual'},({hoy:'Hoy',cartera:'Cartera',numeros:'Números',cotizar:'Cotizar'})[r.v]));
     if(r.v==='hoy')mig.append(el('span',{class:'tx2',style:'margin-left:8px'},
@@ -1441,25 +1685,95 @@ VIEWS.hoy=function(v){
   c2.append(cv,ce);
   g.append(c1,c2); w.append(g);
 
-  if(enEjec.length){
-    const ce2=tarjeta('Pedidos en curso',el('span',{class:'co'},String(enEjec.length)),el('span',{class:'sp'}),
-      el('span',{class:'mi'},'de la OC a la factura'));
-    enEjec.sort((a,b)=>avanceEjec(a)-avanceEjec(b)).forEach(q=>{
-      const f=faltaIngreso(q),i=avanceEjec(q);
-      ce2.append(el('div',{class:'tk'},el('div',{class:'bd'},
-        el('div',{class:'d4'},el('button',{class:'lk',onclick:()=>{UI.openProy=q.proyecto;UI.openCot=q.qid;abrir(q.cuenta,'proyectos');}},
-          folioRev(q)+' · '+q.cuenta)),
-        el('div',{class:'tx2'},(q.oc?'OC '+q.oc+' · ':'')+q.obra),
-        el('div',{class:'mt'},pill(i>=4?'v':'a',q.ejecucion||'sin iniciar'),
-          money(q.neto),q.kg?num(q.kg)+' kg':null,
-          f.length&&i<1?pill('r','faltan '+f.length+' datos para ingresar'):null)),
-        el('div',{class:'ac'},
-          i<EJEC.length-1?el('button',{class:'b xs pri',onclick:()=>setEjecucion(q,EJEC[i+1])},'→ '+EJEC[i+1]):null)));
-    });
-    w.append(ce2);
-  }
+  w.append(lineaDeVida());
   v.append(w);
 };
+
+/* ============================================================
+   LÍNEA DE VIDA
+   Un carril por proyecto activo. Los que ya tienen orden de compra
+   corren sobre el ciclo de ejecución; los demás sobre el comercial.
+   ============================================================ */
+function lineaDeVida(){
+  const conOC=S.cotizaciones.filter(q=>q.estado==='Adjudicada'&&q.ejecucion&&q.ejecucion!=='Facturada')
+    .sort((a,b)=>(trabado(b)?1:0)-(trabado(a)?1:0)||avanceEjec(a)-avanceEjec(b));
+  const enCot=S.cotizaciones.filter(q=>VIVA(q)&&(q.neto||0)>0)
+    .sort((a,b)=>b.neto-a.neto).slice(0,8);
+  const facturadas=S.cotizaciones.filter(q=>q.ejecucion==='Facturada').length;
+  const card=el('div',{class:'c vida'});
+  card.append(el('header',{},el('h3',{},'Línea de vida de los proyectos'),
+    conOC.length?pill(conOC.some(trabado)?'r':'v',conOC.length+' con orden de compra'):null,
+    el('span',{class:'sp'}),
+    facturadas?el('span',{class:'mi'},facturadas+' ya facturadas'):null,
+    el('button',{class:'b xs',onclick:()=>{UI.vista='embudo';irA({v:'cartera'});}},'Ver el embudo')));
+
+  if(conOC.length){
+    card.append(el('div',{class:'vidacab'},el('div',{class:'idc'},'Con orden de compra'),
+      el('div',{class:'pista'},'OC → Ingreso → Programa → Despacho → Entrega → Factura'),
+      el('div',{class:'lat'},'Estado')));
+    conOC.forEach(q=>card.append(carril(q,'ejecucion')));
+  }
+  if(enCot.length){
+    card.append(el('div',{class:'vidacab'},el('div',{class:'idc'},'En cotización'),
+      el('div',{class:'pista'},'Por enviar → Enviada → En revisión → En negociación → Adjudicada'),
+      el('div',{class:'lat'},'Vigencia')));
+    enCot.forEach(q=>card.append(carril(q,'comercial')));
+  }
+  if(!conOC.length&&!enCot.length)
+    card.append(vacio(ICO.cotizar,'Todavía no hay nada en curso',
+      'Cuando tengas cotizaciones vivas u órdenes de compra, cada una va a correr en su carril aquí.',
+      el('button',{class:'b pri',onclick:()=>crearCotizacion()},'Crear cotización')));
+  return card;
+}
+function carril(q,modo){
+  const p=proyecto(q.proyecto);
+  const etapas=modo==='ejecucion'?EJEC:FLUJO;
+  const idx=modo==='ejecucion'?avanceEjec(q):FLUJO.indexOf(q.estado);
+  const tr=modo==='ejecucion'&&trabado(q);
+  const w=el('div',{class:'carril'});
+
+  const idc=el('div',{class:'idc'});
+  idc.append(el('button',{class:'cta',onclick:()=>{UI.openCot=q.qid;
+      if(p)irA({v:'proyecto',id:p.pid}); else abrir(q.cuenta,'proyectos');}},p?p.nombre:q.obra),
+    el('div',{class:'sub'},q.cuenta),
+    el('div',{class:'sub'},folioRev(q)+(q.oc?' · OC '+q.oc:'')+(p?.comuna?' · '+p.comuna:'')),
+    el('div',{class:'mto'},money(q.neto),q.kg?el('span',{class:'mi'},'  '+num(q.kg)+' kg'):null));
+  w.append(idc);
+
+  const pista=el('div',{class:'pista'});
+  const riel=el('div',{class:'riel'});
+  etapas.forEach((e,i)=>{
+    const cls='nodo '+(i<idx?'ok':i===idx?(tr?'trabado':'aqui'):'');
+    const fh=modo==='ejecucion'?q.hitos?.[HITO[e]]:null;
+    const nd=el('div',{class:cls});
+    nd.append(el('div',{class:'barra'}),el('span',{class:'pt'}),
+      el('div',{class:'et'},e),fh?el('div',{class:'fh'},fdate(fh)):null);
+    nd.title=(i===idx?'Está aquí · ':'')+e;
+    if(modo==='ejecucion'&&i!==idx)nd.style.cursor='pointer',nd.onclick=()=>setEjecucion(q,e);
+    riel.append(nd);
+  });
+  pista.append(riel);
+  w.append(pista);
+
+  const lat=el('div',{class:'lat'});
+  if(modo==='ejecucion'){
+    const d=diasEnEtapa(q),f=faltaIngreso(q);
+    if(tr&&f.length&&idx<1)lat.append(pill('r','faltan '+f.length+' datos'));
+    else if(tr)lat.append(pill('r',d+' días parado'));
+    else lat.append(pill(idx>=4?'v':'a',q.ejecucion));
+    if(d!==null&&!tr)lat.append(el('span',{class:'est'},d===0?'movió hoy':'hace '+d+'d'));
+    if(idx<EJEC.length-1)lat.append(el('button',{class:'b xs pri',onclick:()=>setEjecucion(q,EJEC[idx+1])},
+      'Avanzar'));
+  }else{
+    const d=dias(q.validez);
+    lat.append(d===null?pill('g','sin vigencia'):pill(d<0?'r':d<=7?'m':'g',d<0?Math.abs(d)+'d vencida':'vence en '+d+'d'));
+    lat.append(el('span',{class:'est'},Math.round(probEf(q)*100)+'% · '+money(ponderadoAj(q))));
+    if(q.estado!=='Adjudicada')lat.append(el('button',{class:'b xs',
+      onclick:()=>setEstadoCot(q,FLUJO[Math.min(idx+1,FLUJO.length-1)])},'Avanzar'));
+  }
+  w.append(lat);
+  return w;
+}
 
 function filaTarea(t,conCuenta){
   const d=dias(t.fecha);
@@ -1898,59 +2212,120 @@ function pgProyectos(w,c){
   ps.forEach(p=>w.append(tarjetaProyecto(p,c)));
 }
 function tarjetaProyecto(p,c){
-  const qs=cotsDeProy(p.pid),vv=qs.filter(VIVA),ab=UI.openProy===p.pid;
-  const card=el('div',{class:'c'});
-  const hd=el('header',{});
-  hd.append(el('button',{class:'b ico sutil','aria-expanded':ab?'true':'false',
+  const qs=cotsDeProy(p.pid),vv=qs.filter(VIVA),gan=qs.filter(q=>q.estado==='Adjudicada');
+  const ab=UI.openProy===p.pid;
+  const clase={'Activo':'act','En estudio':'est','Suspendido':'pau','Perdido':'per','Cerrado':''}[p.estado]||'';
+  const card=el('div',{class:'proy '+clase+(ab?' abierto':'')});
+
+  const ph=el('div',{class:'ph'});
+  ph.append(el('button',{class:'b ico sutil','aria-expanded':ab?'true':'false',
       onclick:()=>{UI.openProy=ab?null:p.pid;UI.openCot=null;render();}},ab?'▾':'▸'),
-    el('h3',{},edit(p,'nombre',{nombre:'nombre del proyecto',desc:'renombrar proyecto'})),
-    pill(p.estado==='Activo'?'v':p.estado==='Perdido'?'r':'g',p.estado||'—'),
-    el('span',{class:'sp'}),
-    el('span',{class:'mi'},qs.length+(qs.length===1?' cotización':' cotizaciones')),
-    el('span',{class:'num d4'},money(vv.reduce((a,q)=>a+(q.neto||0),0))));
-  card.append(hd);
-  if(!ab){ card.append(el('div',{style:'padding:9px var(--s4)'},el('span',{class:'mi'},
-    [p.comuna,p.mandante].filter(Boolean).join(' · ')||'sin comuna ni mandante'))); return card; }
+    el('div',{class:'tit'},el('button',{class:'lk',style:'font-size:15px;font-weight:600',
+      title:'Abrir la hoja de esta obra',onclick:()=>irA({v:'proyecto',id:p.pid})},p.nombre)),
+    pill(p.estado==='Activo'?'v':p.estado==='Perdido'?'r':p.estado==='Suspendido'?'m':'a',p.estado||'—',true),
+    el('span',{class:'sp',style:'flex:1'}),
+    el('button',{class:'b xs',onclick:()=>crearCotizacion(c.nombre,p.pid)},'+ Cotización'),
+    el('button',{class:'b xs ico',title:'Más',onclick:e=>menu(e.currentTarget,[
+      {titulo:p.nombre,items:[
+        {txt:'Abrir la hoja del proyecto',fn:()=>irA({v:'proyecto',id:p.pid})},
+        {txt:'Cotizar con el cotizador',fn:()=>abrirCotizador({cuenta:c.nombre,proyecto:p.pid})},
+        {txt:'Nueva cotización',fn:()=>crearCotizacion(c.nombre,p.pid)},
+        {txt:'Borrar proyecto',fn:()=>borrar('proyecto',p)}]}])},'···'));
+  card.append(ph);
+
+  const fr=el('div',{class:'franja'});
+  const dato=(l,v,txt)=>fr.append(el('div',{class:'dato'},el('span',{class:'dl2'},l),
+    el('span',{class:'dv'+(txt?' txt':'')},v)));
+  dato('Monto vivo',money(vv.reduce((a,q)=>a+(q.neto||0),0)));
+  dato('Ponderado',money(vv.reduce((a,q)=>a+ponderadoAj(q),0)));
+  if(gan.length)dato('Ganado',money(gan.reduce((a,q)=>a+(q.neto||0),0)));
+  dato('Cotizaciones',String(qs.length)+(qs.reduce((a,q)=>a+(q.versiones||[]).length,0)?' · '+qs.reduce((a,q)=>a+(q.versiones||[]).length,0)+' rev.':''));
+  dato('Comuna',p.comuna||'sin definir',true);
+  if(p.mandante)dato('Mandante',p.mandante,true);
+  const enEj=qs.filter(q=>q.ejecucion&&q.ejecucion!=='Facturada');
+  if(enEj.length)fr.append(el('div',{class:'dato'},el('span',{class:'dl2'},'Ejecución'),
+    el('span',{},pill(enEj.some(trabado)?'r':'a',enEj[0].ejecucion))));
+  card.append(fr);
+  if(!ab)return card;
+
   const dl=el('dl',{class:'dl'}),put=(k,x)=>{dl.append(el('dt',{},k),el('dd',{},x));};
   put('Estado',edit(p,'estado',{options:EST_PROY,nombre:'estado'}));
-  put('Comuna',edit(p,'comuna',{nombre:'comuna'}));
+  put('Comuna',edit(p,'comuna',{nombre:'comuna',ph:'añadir comuna'}));
   put('Dirección',edit(p,'direccion',{nombre:'dirección'}));
   put('Mandante',edit(p,'mandante',{nombre:'mandante'}));
   put('Inicio de obra',edit(p,'inicio',{type:'date',nombre:'fecha',fmt:x=>x?fdate(x):''}));
   put('Notas',edit(p,'notas',{multiline:true,blq:true,nombre:'notas'}));
   card.append(dl);
-  qs.sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||'')).forEach(q=>card.append(bloqueCotizacion(q)));
-  if(!qs.length)card.append(vacio(ICO.cotizar,'Obra sin cotizar','Está identificada pero nadie le ha puesto precio.',
-    el('button',{class:'b pri',onclick:()=>crearCotizacion(c.nombre,p.pid)},'Cotizar esta obra')));
-  card.append(el('div',{class:'adder'},
-    el('button',{class:'b pri',onclick:()=>crearCotizacion(c.nombre,p.pid)},'Nueva cotización aquí'),
-    el('button',{class:'b',onclick:()=>abrirCotizador({cuenta:c.nombre,proyecto:p.pid})},'Cotizar con el cotizador'),
-    el('span',{class:'sp',style:'flex:1'}),
-    el('button',{class:'b sutil peli',onclick:()=>borrar('proyecto',p)},'Borrar proyecto')));
+  card.append(tablaCotizaciones(p,c));
   return card;
+}
+
+/* ---------- todas las cotizaciones del proyecto de un vistazo ---------- */
+function tablaCotizaciones(p,c){
+  const qs=cotsDeProy(p.pid).sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||''));
+  const w=el('div',{});
+  if(!qs.length){
+    w.append(vacio(ICO.cotizar,'Obra sin cotizar','Está identificada pero nadie le ha puesto precio.',
+      el('button',{class:'b pri',onclick:()=>crearCotizacion(c.nombre,p.pid)},'Cotizar esta obra'),
+      el('button',{class:'b',onclick:()=>abrirCotizador({cuenta:c.nombre,proyecto:p.pid})},'Usar el cotizador')));
+    return w;
+  }
+  const t=el('table',{class:'cots'},el('thead',{},el('tr',{},
+    el('th',{style:'width:26px'},''),el('th',{},'Folio'),el('th',{},'Alcance'),el('th',{},'Etapa'),
+    el('th',{style:'text-align:right'},'Neto'),el('th',{style:'text-align:right'},'kg'),
+    el('th',{style:'text-align:right'},'$/kg'),el('th',{},'Vigencia'),el('th',{},'Rev.'))));
+  const tb=el('tbody');
+  qs.forEach(q=>{
+    const d=dias(q.validez),abierta=UI.openCot===q.qid,nv=(q.versiones||[]).length;
+    tb.append(el('tr',{class:abierta?'abierta':'',onclick:()=>{UI.openCot=abierta?null:q.qid;render();}},
+      el('td',{},el('span',{class:'chv'},abierta?'▾':'▸')),
+      el('td',{class:'fol'},folioRev(q)),
+      el('td',{},el('span',{class:'corta',style:'max-width:230px'},q.obra||'—')),
+      el('td',{},pill(q.estado==='Adjudicada'?'v':q.estado==='Perdida'?'r':q.estado==='En pausa'?'m':'a',q.estado),
+        q.ejecucion?el('span',{style:'margin-left:5px'},pill(q.ejecucion==='Facturada'?'v':trabado(q)?'r':'m',q.ejecucion)):null),
+      el('td',{class:'n'},money(q.neto)),
+      el('td',{class:'n'},q.kg?num(q.kg):'—'),
+      el('td',{class:'n'},q.kg&&q.neto?'$'+num(Math.round(q.neto/q.kg)):'—'),
+      el('td',{},d===null?pill('g','—'):pill(d<0?'r':d<=7?'m':'g',d<0?Math.abs(d)+'d tarde':fdate(q.validez))),
+      el('td',{class:'n'},nv?'r0–r'+q.rev:'—')));
+  });
+  const vv=qs.filter(VIVA);
+  t.append(tb,el('tfoot',{},el('tr',{},el('td',{colspan:'4',style:'font-weight:600;background:var(--panel2)'},
+      vv.length+' viva(s) de '+qs.length),
+    el('td',{class:'n',style:'font-weight:600;background:var(--panel2)'},money(vv.reduce((a,q)=>a+(q.neto||0),0))),
+    el('td',{class:'n',style:'background:var(--panel2)'},num(vv.reduce((a,q)=>a+(q.kg||0),0))||'—'),
+    el('td',{colspan:'3',style:'background:var(--panel2)'},''))));
+  w.append(t);
+  const abierta=qs.find(q=>q.qid===UI.openCot);
+  if(abierta)w.append(el('div',{style:'padding:var(--s3)'},docCotizacion(abierta)));
+  else w.append(el('div',{class:'adder'},
+    el('span',{class:'mi',style:'align-self:center;flex:1'},'Clic en una fila para ver el detalle completo de esa cotización.'),
+    el('button',{class:'b',onclick:()=>abrirCotizador({cuenta:c.nombre,proyecto:p.pid})},'Cotizar con el cotizador'),
+    el('button',{class:'b pri',onclick:()=>crearCotizacion(c.nombre,p.pid)},'Nueva cotización')));
+  return w;
 }
 
 /* ============ COTIZACIÓN: comercial + ejecución ============ */
 const FLUJO=['Por enviar','Enviada','En revisión','En negociación','Adjudicada'];
 function bloqueCotizacion(q){
-  const d=dias(q.validez),ab=UI.openCot===q.qid,nv=(q.versiones||[]).length;
-  const w=el('div',{style:'border-top:1px solid var(--linea)'});
-  const cab=el('div',{style:'display:flex;gap:9px;align-items:center;padding:10px var(--s4);background:var(--panel2);flex-wrap:wrap'});
-  cab.append(el('button',{class:'b ico sutil','aria-expanded':ab?'true':'false',
-      onclick:()=>{UI.openCot=ab?null:q.qid;render();}},ab?'▾':'▸'),
-    el('span',{class:'num d4'},folioRev(q)),
+  const d=dias(q.validez),nv=(q.versiones||[]).length;
+  const w=el('div',{class:'detalle'});
+  const dh=el('div',{class:'dh'});
+  dh.append(el('span',{class:'fol'},folioRev(q)),
     pill(q.estado==='Adjudicada'?'v':q.estado==='Perdida'?'r':'a',q.estado),
-    q.ejecucion?pill(q.ejecucion==='Facturada'?'v':'m',q.ejecucion):null,
-    d===null?pill('g','sin vigencia'):pill(d<0?'r':d<=7?'m':'g',d<0?Math.abs(d)+'d tarde':d+'d'),
-    nv?pill('g',nv+' rev.'):null,
+    q.ejecucion?pill(q.ejecucion==='Facturada'?'v':trabado(q)?'r':'m',q.ejecucion):null,
+    d===null?pill('g','sin vigencia'):pill(d<0?'r':d<=7?'m':'g',d<0?Math.abs(d)+'d tarde':'vence '+fdate(q.validez)),
+    nv?pill('g',nv+' revisiones'):null,
     el('span',{class:'sp',style:'flex:1'}),
-    el('span',{class:'num d4'},money(q.neto)),
-    q.kg?el('span',{class:'mi num'},num(q.kg)+' kg'):null);
-  w.append(cab);
-  if(!ab)return w;
+    el('span',{style:'font-family:var(--m);font-size:16px;font-weight:600'},money(q.neto)),
+    q.kg?el('span',{class:'mi num'},num(q.kg)+' kg · $'+num(Math.round(q.neto/q.kg))+'/kg'):null,
+    el('button',{class:'b xs sutil',onclick:()=>{UI.openCot=null;render();}},'Cerrar'));
+  w.append(dh);
 
-  w.append(via(q));
-  if(q.estado==='Adjudicada')w.append(viaEjecucion(q),bloqueRequisitos(q));
+  const sec=(titulo,contenido)=>{const s=el('div',{class:'sec'});
+    if(titulo)s.append(el('div',{class:'st'},titulo)); s.append(contenido); return s;};
+  w.append(sec(null,via(q)));
+  if(q.estado==='Adjudicada'){ w.append(sec(null,viaEjecucion(q)),sec(null,bloqueRequisitos(q))); }
 
   const dl=el('dl',{class:'dl'}),put=(k,x)=>{dl.append(el('dt',{},k),el('dd',{},x));};
   put('Folio',edit(q,'folio',{nombre:'folio'}));
@@ -1967,26 +2342,16 @@ function bloqueCotizacion(q){
   if(q.estado==='Perdida')put('Motivo',edit(q,'motivoPerdida',{nombre:'motivo',blq:true}));
   else put('N° OC',edit(q,'oc',{nombre:'número de OC',ph:'añadir número de OC'}));
   put('Nota',edit(q,'nota',{nombre:'nota',multiline:true,blq:true,ph:'qué falta, qué prometiste'}));
-  w.append(dl,tablaLineas(q));
+  w.append(sec('Ficha de la cotización',dl));
+  w.append(sec('Líneas de producto',tablaLineas(q)));
 
   if((q.incidencias||[]).length){
     const inc=el('div',{style:'padding:0 var(--s4) var(--s3)'});
-    inc.append(el('div',{class:'d4',style:'padding:10px 0 6px'},'Incidencias'));
-    q.incidencias.forEach(x=>inc.append(el('div',{style:'display:flex;gap:9px;padding:6px 0;border-top:1px solid var(--linea)'},
+    q.incidencias.forEach(x=>inc.append(el('div',{style:'display:flex;gap:9px;padding:8px 0;border-top:1px solid var(--linea)'},
       pill(x.tipo.indexOf('Rechazo')===0?'r':'m',fdate(x.fecha)),
       el('div',{style:'flex:1'},el('div',{class:'tx'},x.tipo),x.detalle?el('div',{class:'tx2'},x.detalle):null))));
-    w.append(inc);
+    w.append(sec('Incidencias',inc));
   }
-
-  w.append(el('div',{class:'adder'},
-    el('button',{class:'b pri',onclick:()=>nuevaRevision(q)},'Nueva revisión'),
-    el('button',{class:'b',onclick:()=>abrirCotizador({cuenta:q.cuenta,proyecto:q.proyecto,qid:q.qid})},'Abrir en el cotizador'),
-    el('button',{class:'b',onclick:()=>reemitir(q)},'Reemitir con folio nuevo'),
-    el('button',{class:'b',onclick:()=>mut('tarea de seguimiento',()=>nuevaTarea(q.cuenta,'Seguimiento '+folioRev(q),iso(new Date(HOY.getTime()+3*864e5)),'esperando',q.folio))},'Agendar seguimiento'),
-    q.estado==='Adjudicada'?el('button',{class:'b',onclick:()=>registrarIncidencia(q)},'Registrar incidencia'):null,
-    el('span',{style:'flex:1'}),
-    el('button',{class:'b sutil peli',onclick:()=>borrar('cotizacion',q)},'Borrar')));
-
   if(nv){
     const t=el('table',{class:'lin'},el('thead',{},el('tr',{},el('th',{},'Rev'),el('th',{},'Guardada'),
       el('th',{style:'text-align:right'},'Neto'),el('th',{style:'text-align:right'},'kg'),
@@ -1998,8 +2363,16 @@ function bloqueCotizacion(q){
       el('td',{},x.estado),el('td',{class:'tx2'},x.motivo||'—'),
       el('td',{},el('button',{class:'b xs',onclick:()=>restaurarVersion(q,x)},'Restaurar')))));
     t.append(tb);
-    w.append(el('div',{},el('div',{class:'d4',style:'padding:12px var(--s4) 6px'},'Revisiones anteriores'),t));
+    w.append(sec('Revisiones anteriores',t));
   }
+  w.append(el('div',{class:'adder',style:'border-radius:0 0 var(--r2) var(--r2)'},
+    el('button',{class:'b pri',onclick:()=>nuevaRevision(q)},'Nueva revisión'),
+    el('button',{class:'b',onclick:()=>abrirCotizador({cuenta:q.cuenta,proyecto:q.proyecto,qid:q.qid})},'Abrir en el cotizador'),
+    el('button',{class:'b',onclick:()=>reemitir(q)},'Reemitir con folio nuevo'),
+    el('button',{class:'b',onclick:()=>mut('tarea de seguimiento',()=>nuevaTarea(q.cuenta,'Seguimiento '+folioRev(q),iso(new Date(HOY.getTime()+3*864e5)),'esperando',q.folio))},'Agendar seguimiento'),
+    q.estado==='Adjudicada'?el('button',{class:'b',onclick:()=>registrarIncidencia(q)},'Registrar incidencia'):null,
+    el('span',{style:'flex:1'}),
+    el('button',{class:'b sutil peli',onclick:()=>borrar('cotizacion',q)},'Borrar')));
   return w;
 }
 function via(q){
@@ -2173,7 +2546,49 @@ VIEWS.numeros=function(v){
       el('div',{style:'flex:1;min-width:0'},el('div',{class:'d4'},x.t+' — '+x.items.length),
         el('div',{class:'tx2'},x.w),cl)));
   });
-  w.append(salud); v.append(w);
+  w.append(salud);
+
+  /* ---- estado del archivo documental ---- */
+  const arc=el('div',{class:'c'});
+  const est=S.cotizaciones.map(q=>({q,a:estadoDoc(q)}));
+  const sinJson=est.filter(x=>!x.a.json).length, sinPdf=est.filter(x=>!x.a.pdf).length;
+  arc.append(el('header',{},el('h3',{},'Archivo documental'),
+    el('span',{class:'co'},'Cartera BB'),
+    el('span',{class:'sp'}),
+    el('span',{class:'mi'},DIR?('carpeta '+DIR.name):'sin carpeta conectada'),
+    el('button',{class:'b xs',onclick:()=>escanearArchivo().then(render)},'Reexaminar'),
+    el('button',{class:'b xs pri',onclick:archivarTodas},'Archivar todas')));
+  arc.append(el('div',{style:'padding:11px var(--s4);border-bottom:1px solid var(--linea);font-size:12.5px;color:var(--t2);line-height:1.7'},
+    el('div',{},'Cada cotización deja tres rastros bajo la clave ',el('code',{style:'font-family:var(--m)'},'FOLIO_rN'),':'),
+    el('div',{style:'font-family:var(--m);font-size:11.5px;color:var(--t3);margin-top:4px'},
+      'cotizaciones/ → .json (datos) · .html (documento) · .cotizador.json (si vino del cotizador)'),
+    el('div',{style:'font-family:var(--m);font-size:11.5px;color:var(--t3)'},
+      'cotizaciones_pdf/ → .pdf, que lo deja el barrido de correo'),
+    el('div',{style:'font-family:var(--m);font-size:11.5px;color:var(--t3)'},
+      'correos/ → los barridos diarios del flujo')));
+  const tw2=el('div',{class:'tw'});
+  const t2=el('table',{class:'tabla'},el('thead',{},el('tr',{},el('th',{class:'fijo'},'Clave'),
+    el('th',{class:'fijo'},'Cuenta'),el('th',{class:'fijo'},'Etapa'),el('th',{class:'fijo'},'JSON'),
+    el('th',{class:'fijo'},'HTML'),el('th',{class:'fijo'},'PDF'),el('th',{class:'fijo'},''))));
+  const tb2=el('tbody');
+  est.sort((a,b)=>(a.a.pdf?1:0)-(b.a.pdf?1:0)||a.q.folio.localeCompare(b.q.folio)).forEach(({q,a})=>{
+    tb2.append(el('tr',{},
+      el('td',{class:'mo'},el('button',{class:'lk',onclick:()=>{UI.openCot=q.qid;
+        if(q.proyecto)irA({v:'proyecto',id:q.proyecto}); else abrir(q.cuenta,'proyectos');}},claveDoc(q))),
+      el('td',{},el('span',{class:'corta',style:'max-width:230px'},q.cuenta)),
+      el('td',{},pill(q.estado==='Adjudicada'?'v':q.estado==='Perdida'?'r':'a',q.estado)),
+      el('td',{},a.json?pill('v','✓'):pill('g','—')),
+      el('td',{},a.html?pill('v','✓'):pill('g','—')),
+      el('td',{},a.pdf?pill('v','✓'):pill('r','falta')),
+      el('td',{},el('button',{class:'b xs',onclick:()=>archivarCotizacion(q).then(render)},'Archivar'),' ',
+        el('button',{class:'b xs sutil',onclick:()=>descargarDoc(q)},'Descargar'))));
+  });
+  t2.append(tb2); tw2.append(t2); arc.append(tw2);
+  if(sinPdf)arc.append(el('div',{class:'bloqueo'},'⚠',
+    el('div',{},sinPdf+' de '+est.length+' cotizaciones no tienen su PDF archivado. ',
+      'Van a aparecer solas cuando el barrido de correo empiece a guardar los adjuntos que enviaste.')));
+  w.append(arc);
+  v.append(w);
 };
 
 /* ============ COTIZAR ============ */
@@ -2257,11 +2672,12 @@ function recibirCotizacion(m){
     ['Ver',()=>{UI.openProy=p.pid;UI.openCot=q.qid;abrir(c.nombre,'proyectos');}]);
 }
 async function guardarSnapshotCot(q,snapshot){
-  if(!DIR||!snapshot)return;
-  try{ const sub=await DIR.getDirectoryHandle('cotizaciones',{create:true});
-    const fh=await sub.getFileHandle(String(q.folio).replace(/[^\w\-]/g,'_')+'_r'+(q.rev||0)+'.json',{create:true});
-    const w=await fh.createWritable(); await w.write(new Blob([JSON.stringify(snapshot)],{type:'application/json'})); await w.close();
-  }catch(e){}
+  if(!DIR)return;
+  /* el snapshot crudo del cotizador va aparte, para no pisar el registro del CRM */
+  if(snapshot){ try{ await escribirEn(D_COT,claveDoc(q)+'.cotizador.json',
+    new Blob([JSON.stringify(snapshot)],{type:'application/json'})); }catch(e){} }
+  await archivarCotizacion(q,true);
+  escanearArchivo();
 }
 
 /* ============ salud ============ */
@@ -2303,6 +2719,266 @@ function checks(){
   add('baja','Contactos sin teléfono','El correo solo no basta cuando hay que empujar.',
     S.contactos.filter(c=>!c.tel).map(c=>c.nombre+' ('+c.cuenta+')'));
   return C;
+}
+
+/* ============================================================
+   PÁGINA DE PROYECTO
+   La obra deja de vivir dentro de la ficha del cliente y tiene su
+   propia hoja, con URL propia: se puede compartir y volver atrás.
+   ============================================================ */
+function pgProyecto(v,p){
+  const c=cuenta(p.cuenta);
+  const qs=cotsDeProy(p.pid).sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||''));
+  const vv=qs.filter(VIVA),gan=qs.filter(q=>q.estado==='Adjudicada');
+  const w=el('div',{class:'ancho rej'});
+  const clase={'Activo':'act','En estudio':'est','Suspendido':'pau','Perdido':'per','Cerrado':''}[p.estado]||'';
+
+  const cab=el('div',{class:'pgcab '+clase});
+  const top=el('div',{class:'top'});
+  top.append(el('div',{style:'flex:1;min-width:0'},
+    el('h1',{},edit(p,'nombre',{nombre:'nombre de la obra',desc:'renombrar proyecto'})),
+    el('div',{class:'sub'},
+      el('button',{class:'lk',onclick:()=>abrir(p.cuenta)},p.cuenta),
+      el('span',{style:'color:var(--t3)'},'·'),
+      pill(p.estado==='Activo'?'v':p.estado==='Perdido'?'r':p.estado==='Suspendido'?'m':'a',p.estado||'—',true),
+      p.comuna?el('span',{},p.comuna):el('span',{style:'color:var(--t3)'},'sin comuna'),
+      p.mandante?el('span',{},'· '+p.mandante):null)),
+    el('button',{class:'b',onclick:()=>crearCotizacion(p.cuenta,p.pid)},'Nueva cotización'),
+    el('button',{class:'b pri',onclick:()=>abrirCotizador({cuenta:p.cuenta,proyecto:p.pid})},'Cotizar'),
+    el('button',{class:'b ico',title:'Más',onclick:e=>menu(e.currentTarget,[
+      {titulo:p.nombre,items:[
+        {txt:'Ver la cuenta completa',fn:()=>abrir(p.cuenta)},
+        {txt:'Agendar una tarea',fn:async()=>{const r=await ask('Nueva tarea en '+p.nombre,
+          [{k:'t',label:'Tarea'},{k:'f',label:'Fecha',type:'date',value:iso(HOY)},
+           {k:'tipo',label:'Tipo',type:'select',options:['mio','esperando'],value:'mio'}],'Agendar');
+          if(!r||!r.t.trim())return; mut('nueva tarea',()=>nuevaTarea(p.cuenta,r.t.trim()+' — '+p.nombre,r.f,r.tipo));}},
+        {txt:'Borrar proyecto',fn:()=>borrar('proyecto',p)}]}])},'···'));
+  cab.append(top);
+  const dl=el('dl',{class:'dl'}),put=(k,x)=>{dl.append(el('dt',{},k),el('dd',{},x));};
+  put('Estado',edit(p,'estado',{options:EST_PROY,nombre:'estado'}));
+  put('Comuna',edit(p,'comuna',{nombre:'comuna',ph:'añadir comuna'}));
+  put('Dirección',edit(p,'direccion',{nombre:'dirección',ph:'añadir dirección de obra'}));
+  put('Mandante',edit(p,'mandante',{nombre:'mandante',ph:'añadir mandante'}));
+  put('Inicio de obra',edit(p,'inicio',{type:'date',nombre:'fecha',fmt:x=>x?fdate(x):''}));
+  put('Notas',edit(p,'notas',{multiline:true,blq:true,nombre:'notas',ph:'contexto de esta obra'}));
+  cab.append(dl); w.append(cab);
+
+  w.append(el('div',{class:'cifras jer'},
+    cifra('Monto vivo',money(vv.reduce((a,q)=>a+(q.neto||0),0)),
+      vv.length+(vv.length===1?' oferta abierta':' ofertas abiertas'),'hero'),
+    cifra('Ponderado',money(vv.reduce((a,q)=>a+ponderadoAj(q),0)),'ajustado por vigencia'),
+    cifra('Ganado',money(gan.reduce((a,q)=>a+(q.neto||0),0)),gan.length+' órdenes','ok'),
+    cifra('Kilos vivos',num(vv.reduce((a,q)=>a+(q.kg||0),0))||'—',
+      vv.filter(q=>!q.kg).length?vv.filter(q=>!q.kg).length+' sin kilos cargados':'todas con kilos',
+      vv.some(q=>!q.kg)?'oj':'ok'),
+    cifra('Revisiones',String(qs.reduce((a,q)=>a+(q.versiones||[]).length,0)+qs.length),
+      qs.length+(qs.length===1?' cotización':' cotizaciones'))));
+
+  const enEj=qs.filter(q=>q.ejecucion&&q.ejecucion!=='Facturada');
+  if(enEj.length){
+    const lv=el('div',{class:'c vida'});
+    lv.append(el('header',{},el('h3',{},'Pedidos en curso de esta obra'),
+      pill(enEj.some(trabado)?'r':'v',String(enEj.length))));
+    lv.append(el('div',{class:'vidacab'},el('div',{class:'idc'},'Pedido'),
+      el('div',{class:'pista'},'OC → Ingreso → Programa → Despacho → Entrega → Factura'),
+      el('div',{class:'lat'},'Estado')));
+    enEj.forEach(q=>lv.append(carril(q,'ejecucion')));
+    w.append(lv);
+  }
+
+  const card=el('div',{class:'c'});
+  card.append(el('header',{},el('h3',{},'Cotizaciones de la obra'),el('span',{class:'co'},String(qs.length)),
+    el('span',{class:'sp'}),el('span',{class:'mi'},'clic en una fila para ver el documento completo')));
+  card.append(tablaCotizaciones(p,c||{nombre:p.cuenta}));
+  w.append(card);
+
+  const per=contactosDe(p.cuenta);
+  if(per.length){
+    const cp=el('div',{class:'c'});
+    cp.append(el('header',{},el('h3',{},'Personas de '+p.cuenta),el('span',{class:'co'},String(per.length)),
+      el('span',{class:'sp'}),el('button',{class:'b xs',onclick:()=>abrir(p.cuenta,'personas')},'Ver todas')));
+    per.forEach(x=>cp.append(el('div',{class:'tk'},el('div',{class:'bd'},
+      el('div',{class:'tx'},x.nombre,'  ',pill(x.rol==='Decide'?'v':'g',x.rol||'—')),
+      el('div',{class:'mt'},[x.cargo,x.email,x.tel].filter(Boolean).join(' · '))),
+      el('div',{class:'ac'},x.email?el('a',{class:'b xs',href:'mailto:'+x.email},'Correo'):null))));
+    w.append(cp);
+  }
+
+  const folios=qs.map(q=>q.folio);
+  const bit=bitaDe(p.cuenta).filter(b=>folios.some(f=>b.texto.includes(f))||norm(b.texto).includes(norm(p.nombre)));
+  const cb=el('div',{class:'c'});
+  cb.append(el('header',{},el('h3',{},'Bitácora de la obra'),el('span',{class:'co'},String(bit.length))));
+  const tl=el('div',{class:'linea-t'});
+  bit.slice(0,40).forEach(e=>tl.append(el('div',{class:'ev'},el('div',{class:'pt'}),
+    el('div',{class:'cu'},el('div',{class:'fh'},fdate(e.ts),el('span',{},e.tipo)),
+      el('div',{class:'tx'},e.texto)))));
+  if(!bit.length)tl.append(vacio(ICO.cotizar,'Sin registros de esta obra',
+    'Lo que anotes en la cuenta y mencione la obra o alguno de sus folios aparece aquí.'));
+  cb.append(tl); w.append(cb);
+  v.append(w);
+}
+
+/* ============================================================
+   LA COTIZACIÓN COMO DOCUMENTO
+   Todo lo que sale en el PDF, en pantalla y editable en el sitio.
+   ============================================================ */
+function docCotizacion(q){
+  const p=proyecto(q.proyecto),c=cuenta(q.cuenta);
+  const cond=q.cond||{};
+  const kgTot=(q.lineas||[]).reduce((a,l)=>a+(Number(l.kg)||0),0);
+  const neto=q.neto||0, iva=Math.round(neto*IVA);
+  const w=el('div',{class:'doc'});
+
+  const barra=el('div',{class:'barra-doc'});
+  barra.append(el('div',{class:'grupo'},
+    ...[['doc','Documento'],['proceso','Proceso'],['revs','Revisiones']].map(([k,l])=>
+      el('button',{'aria-current':(UI.docTab||'doc')===k?'true':'false',
+        onclick:()=>{UI.docTab=k;render();}},l,
+        k==='revs'&&(q.versiones||[]).length?el('span',{style:'font-family:var(--m);font-size:10px;opacity:.6;margin-left:5px'},String(q.versiones.length)):null))),
+    el('span',{class:'sp',style:'flex:1'}),
+    (()=>{const a=estadoDoc(q);
+      return el('span',{class:'mi',style:'display:flex;gap:6px;align-items:center',
+        title:'Archivos en Cartera BB con la clave '+claveDoc(q)},
+        el('span',{},'Archivo:'),
+        pill(a.json?'v':'g','JSON'),pill(a.html?'v':'g','HTML'),
+        pill(a.pdf?'v':'r','PDF'),a.cotizador?pill('a','cotizador'):null);})(),
+    el('button',{class:'b xs',onclick:()=>archivarCotizacion(q).then(render)},'Guardar en carpeta'),
+    el('button',{class:'b xs',onclick:()=>window.print(),title:'Imprimir o guardar como PDF'},'Imprimir'),
+    el('button',{class:'b xs',onclick:()=>abrirCotizador({cuenta:q.cuenta,proyecto:q.proyecto,qid:q.qid})},'Abrir en el cotizador'),
+    el('button',{class:'b xs pri',onclick:()=>nuevaRevision(q)},'Nueva revisión'),
+    el('button',{class:'b xs sutil',onclick:()=>{UI.openCot=null;render();}},'Cerrar'));
+  w.append(barra);
+
+  const tab=UI.docTab||'doc';
+  if(tab==='proceso'){
+    w.append(via(q));
+    if(q.estado==='Adjudicada')w.append(viaEjecucion(q),bloqueRequisitos(q));
+    if((q.incidencias||[]).length){
+      const inc=el('div',{style:'padding:var(--s3) var(--s5) var(--s4)'});
+      inc.append(el('div',{class:'d4',style:'margin-bottom:6px'},'Incidencias'));
+      q.incidencias.forEach(x=>inc.append(el('div',{style:'display:flex;gap:9px;padding:8px 0;border-top:1px solid var(--linea)'},
+        pill(x.tipo.indexOf('Rechazo')===0?'r':'m',fdate(x.fecha)),
+        el('div',{style:'flex:1'},el('div',{class:'tx'},x.tipo),x.detalle?el('div',{class:'tx2'},x.detalle):null))));
+      w.append(inc);
+    }
+    w.append(el('div',{class:'adder'},
+      el('button',{class:'b',onclick:()=>reemitir(q)},'Reemitir con folio nuevo'),
+      el('button',{class:'b',onclick:()=>mut('tarea',()=>nuevaTarea(q.cuenta,'Seguimiento '+folioRev(q),iso(new Date(HOY.getTime()+3*864e5)),'esperando',q.folio))},'Agendar seguimiento'),
+      q.estado==='Adjudicada'?el('button',{class:'b',onclick:()=>registrarIncidencia(q)},'Registrar incidencia'):null,
+      el('span',{style:'flex:1'}),
+      el('button',{class:'b sutil peli',onclick:()=>borrar('cotizacion',q)},'Borrar cotización')));
+    return w;
+  }
+  if(tab==='revs'){
+    const nv=(q.versiones||[]).length;
+    if(!nv)w.append(vacio(ICO.cotizar,'Todavía no hay revisiones',
+      'Cuando cambies el alcance o el precio, «Nueva revisión» congela la versión actual y te deja editar la siguiente bajo el mismo folio.',
+      el('button',{class:'b pri',onclick:()=>nuevaRevision(q)},'Crear la revisión 1')));
+    else{
+      const t=el('table',{class:'lin'},el('thead',{},el('tr',{},el('th',{},'Rev'),el('th',{},'Guardada'),
+        el('th',{style:'text-align:right'},'Neto'),el('th',{style:'text-align:right'},'kg'),
+        el('th',{style:'text-align:right'},'Δ vs actual'),el('th',{},'Etapa'),el('th',{},'Qué cambió'),el('th',{}))));
+      const tb=el('tbody');
+      tb.append(el('tr',{style:'background:var(--acc-suave)'},
+        el('td',{class:'mo',style:'font-weight:600'},'r'+(q.rev||0)),el('td',{class:'mo'},fdate(q.fecha)),
+        el('td',{class:'n',style:'font-weight:600'},num(q.neto)),el('td',{class:'n'},num(q.kg)),
+        el('td',{class:'n'},'—'),el('td',{},q.estado),el('td',{class:'tx2'},'versión vigente'),el('td',{})));
+      q.versiones.forEach(x=>{
+        const d=(q.neto||0)-(x.neto||0);
+        tb.append(el('tr',{},
+          el('td',{class:'mo'},'r'+x.rev),el('td',{class:'mo'},fdate(x.ts)),
+          el('td',{class:'n'},num(x.neto)),el('td',{class:'n'},num(x.kg)),
+          el('td',{class:'n',style:'color:'+(d>0?'var(--ok)':d<0?'var(--mal)':'var(--t3)')},
+            d?(d>0?'+':'')+money(d):'igual'),
+          el('td',{},x.estado),el('td',{class:'tx2'},x.motivo||'—'),
+          el('td',{},el('button',{class:'b xs',onclick:()=>restaurarVersion(q,x)},'Restaurar'))));
+      });
+      t.append(tb); w.append(el('div',{style:'padding:var(--s4) var(--s5)'},t));
+    }
+    return w;
+  }
+
+  /* ---- el documento ---- */
+  w.append(el('div',{class:'franja-top'}));
+  w.append(el('div',{class:'encab'},
+    el('div',{},el('div',{class:'marca-doc'},'ACMA',el('small',{},'ACMA S.A. · RUT 92.190.000-7 · Maruri 1942, Renca'))),
+    el('div',{class:'num-doc'},el('div',{class:'t'},'COTIZACIÓN'),
+      el('div',{class:'f'},edit(q,'folio',{nombre:'folio'})),
+      el('div',{class:'r'},'Revisión ',String(q.rev||0)))));
+
+  const cols=el('div',{class:'cols'});
+  const bl=(titulo,filas)=>{const b=el('div',{class:'bloq'});b.append(el('h4',{},titulo));
+    filas.forEach(([k,x])=>b.append(el('dl',{class:'par'},el('dt',{},k),el('dd',{},x))));return b;};
+  cols.append(bl('Cliente',[
+    ['Cliente',c?el('button',{class:'lk',onclick:()=>abrir(q.cuenta)},c.nombre):q.cuenta],
+    ['RUT',edit(q,'rut',{nombre:'RUT',ph:'añadir RUT'})],
+    ['Contacto',edit(q,'contacto',{nombre:'contacto',ph:'añadir contacto'})],
+    ['Email',edit(q,'emailContacto',{nombre:'email',ph:'añadir email'})],
+    ['Obra / Proyecto',p?el('button',{class:'lk',onclick:()=>irA({v:'proyecto',id:p.pid})},p.nombre):edit(q,'obra',{nombre:'obra'})],
+    ['Comuna',p?edit(p,'comuna',{nombre:'comuna',ph:'añadir comuna'}):'—']]));
+  cols.append(bl('Condiciones comerciales',[
+    ['Fecha de emisión',edit(q,'fecha',{type:'date',nombre:'fecha',fmt:x=>x?fdate(x):''})],
+    ['Válida hasta (OC)',el('span',{},edit(q,'validez',{type:'date',nombre:'validez',fmt:x=>x?fdate(x):''}),' ',
+      (()=>{const d=dias(q.validez);return d===null?pill('g','sin vigencia'):pill(d<0?'r':d<=7?'m':'g',d<0?Math.abs(d)+'d vencida':d+'d');})())],
+    ...CAMPOS_COND.map(([k,l])=>[l,edit(cond,k,{nombre:l.toLowerCase(),blq:true,ph:'añadir '+l.toLowerCase()})])]));
+  w.append(cols);
+
+  w.append(el('div',{class:'glosa'},'A continuación, cotizamos a ustedes el material solicitado: ',
+    edit(q,'obra',{nombre:'alcance',blq:true,ph:'describe aquí el alcance como aparece en la cotización'})));
+
+  const tw=el('div',{class:'tblwrap'});
+  const t=el('table',{class:'det'},el('thead',{},el('tr',{},
+    el('th',{style:'width:110px'},'Código'),el('th',{},'Descripción'),
+    el('th',{class:'n',style:'width:96px'},'Peso total (kg)'),el('th',{class:'n',style:'width:80px'},'Valor kg'),
+    el('th',{class:'n',style:'width:110px'},'Valor total'),el('th',{style:'width:32px'},''))));
+  const tb=el('tbody');
+  (q.lineas||[]).forEach(l=>{
+    const tot=(Number(l.kg)||0)*(Number(l.precioKg)||0)+(Number(l.monto)||0);
+    tb.append(el('tr',{},
+      el('td',{class:'cod'},edit(l,'familia',{options:FAMILIAS,blank:true,nombre:'familia',after:()=>recalcNeto(q)})),
+      el('td',{},edit(l,'producto',{blq:true,nombre:'descripción',ph:'descripción del producto'})),
+      el('td',{class:'n'},edit(l,'kg',{type:'number',nombre:'kg',fmt:num,after:()=>recalcNeto(q)})),
+      el('td',{class:'n'},edit(l,'precioKg',{type:'number',nombre:'valor por kilo',fmt:x=>x?'$'+num(x):'',after:()=>recalcNeto(q)})),
+      el('td',{class:'n'},l.monto?edit(l,'monto',{type:'number',nombre:'monto',fmt:x=>'$'+num(x),after:()=>recalcNeto(q)})
+        :el('span',{},'$'+num(tot))),
+      el('td',{},el('button',{class:'b xs sutil peli',onclick:()=>mut('borrar línea',()=>{q.lineas=q.lineas.filter(x=>x!==l);recalcNeto(q);})},'×'))));
+  });
+  if(!(q.lineas||[]).length)tb.append(el('tr',{},el('td',{colspan:'6',style:'padding:20px;text-align:center;color:var(--t3)'},
+    'Esta cotización no tiene el detalle cargado. El neto es $'+num(q.neto)+' pero no sabes de qué está hecho.')));
+  t.append(tb); tw.append(t);
+  tw.append(el('div',{class:'adder',style:'background:transparent;border:0;padding:9px 0'},
+    el('button',{class:'b xs',onclick:()=>mut('nueva línea',()=>{q.lineas=q.lineas||[];
+      q.lineas.push({id:uid(),familia:'Malla electrosoldada',producto:'',kg:null,precioKg:null,monto:null});})},'+ Línea'),
+    el('button',{class:'b xs',onclick:()=>mut('línea de flete',()=>{q.lineas=q.lineas||[];
+      q.lineas.push({id:uid(),familia:'Flete',producto:'Despacho puesto en obra',kg:null,precioKg:null,monto:null});})},'+ Transporte'),
+    el('span',{class:'mi',style:'align-self:center'},
+      (q.lineas||[]).length?'El neto y los kilos salen de estas líneas.':'Sin líneas: el neto se edita en la ficha.')));
+  w.append(tw);
+
+  w.append(el('div',{class:'nota'},el('strong',{},'NOTA TÉCNICA: '),
+    edit(cond,'notaTecnica',{nombre:'nota técnica',multiline:true,blq:true,
+      ph:'alcance, supuestos, exclusiones, referencias de planos y todo lo que te protege después'})));
+
+  const tt=el('table',{},el('tbody',{},
+    el('tr',{},el('td',{class:'l'},'Total neto'),el('td',{class:'v'},'$'+num(neto))),
+    el('tr',{},el('td',{class:'l'},'IVA 19%'),el('td',{class:'v'},'$'+num(iva))),
+    el('tr',{class:'gran'},el('td',{class:'l'},'Total'),el('td',{class:'v'},'$'+num(neto+iva)))));
+  w.append(el('div',{class:'totes'},tt));
+
+  const gr=el('div',{class:'grales'});
+  gr.append(el('h4',{},'Condiciones generales'));
+  CAMPOS_GRAL.forEach(([k,l])=>gr.append(el('dl',{class:'par',style:'grid-template-columns:150px 1fr'},
+    el('dt',{},l),el('dd',{},edit(cond,k,{nombre:l.toLowerCase(),blq:true,ph:'añadir '+l.toLowerCase()})))));
+  w.append(gr);
+
+  w.append(el('div',{class:'firma'},
+    el('div',{},kgTot?el('div',{class:'mi num'},'Peso total del detalle: '+num(kgTot)+' kg'+
+      (neto&&kgTot?'  ·  precio medio $'+num(Math.round(neto/kgTot))+'/kg':'')):null,
+      q.oc?el('div',{class:'mi'},'Orden de compra: '+q.oc):null),
+    el('div',{style:'text-align:right'},el('div',{class:'fn'},'Benjamín Bittelman'),
+      el('div',{class:'fc'},'Key Account Manager · ACMA S.A.'),
+      el('div',{class:'fc'},'bbittelman@acma.cl · +56 9 8360 8787'))));
+  return w;
 }
 
 /* ============ PALETA DE COMANDOS ============
@@ -2402,7 +3078,7 @@ function vPuerta(v){
     w.append(pcard('Reconectar la carpeta «'+PEND.name+'»',
       'Por seguridad el navegador te vuelve a pedir permiso cada tanto. Un clic y sigues donde estabas.',
       el('button',{class:'b pri',onclick:async()=>{ if(await permiso(PEND,true)){DIR=PEND;PEND=null;
-        const t=await leerTexto(F_JSON); if(t){try{S=migrar(JSON.parse(t));}catch(e){}} render();}
+        const t=await leerTexto(F_JSON); if(t){try{S=migrar(JSON.parse(t));}catch(e){}} await escanearArchivo(); render();}
         else toast('No diste el permiso'); }},'Dar permiso'),
       el('button',{class:'b',onclick:async()=>{await delH();PEND=null;render();}},'Elegir otra carpeta')));
     v.append(w); return;
@@ -2411,7 +3087,7 @@ function vPuerta(v){
     w.append(pcard('Conecta tu carpeta',
       'Elige la carpeta sincronizada de OneDrive donde quieres que se guarde todo. El panel escribe ahí cartera.json y respaldo_cartera.xlsx. Nada se sube a internet.',
       el('button',{class:'b pri',onclick:async()=>{ if(await elegirCarpeta()){
-        const t=await leerTexto(F_JSON); if(t){try{S=migrar(JSON.parse(t));toast('Cartera encontrada');}catch(e){}} render();}
+        const t=await leerTexto(F_JSON); if(t){try{S=migrar(JSON.parse(t));toast('Cartera encontrada');}catch(e){}} await escanearArchivo(); render();}
         else toast('No se eligió ninguna carpeta'); }},'Conectar carpeta')));
     v.append(w); return;
   }
@@ -2444,7 +3120,7 @@ async function boot(){
   if(soporta()){
     const h=await getH();
     if(h){ if(await permiso(h,false)){ DIR=h; const t=await leerTexto(F_JSON);
-      if(t){ try{ S=migrar(JSON.parse(t)); flag('carpeta '+h.name); }catch(e){} } } else PEND=h; }
+      if(t){ try{ S=migrar(JSON.parse(t)); flag('carpeta '+h.name); await escanearArchivo(); }catch(e){} } } else PEND=h; }
   }
   render();
 }
