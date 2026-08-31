@@ -718,6 +718,8 @@ function migrar(st){
   st.tareas=st.tareas||[];
   st.proyectos=st.proyectos||[];
   st.correos=st.correos||[]; st.vistos=st.vistos||[];
+  if(st.autoAplicar===undefined)st.autoAplicar=true;
+  if(st.autoDescartarInternos===undefined)st.autoDescartarInternos=false;
   st.proyectos.forEach(p=>{ if(p.lat===undefined)p.lat=''; if(p.lng===undefined)p.lng=''; });
   st.cuentas=st.cuentas||[];
   st.cuentas.forEach(c=>{
@@ -3417,9 +3419,12 @@ async function cargarArchivosBarrido(files){
     if(!/\.json$/i.test(f.name)){malos++;continue;}
     try{ n+=ingerirBarrido(JSON.parse(await f.text())); }catch(e){ malos++; }
   }
-  if(n){ snap('cargar barrido'); save(); }
+  if(n){ snap('cargar barrido');
+    if(S.autoAplicar!==false){ const r=procesarAuto(); toast(n+' correos leídos · '+resumenAuto(r)); }
+    else toast(n+' correo(s) nuevo(s) cargado(s)');
+    save(); }
+  else toast(malos?'Ninguno de esos archivos era un barrido válido':'Sin correos nuevos: ya estaban todos');
   render();
-  toast(n?(n+' correo(s) nuevo(s) cargado(s)'):(malos?'Ninguno de esos archivos era un barrido válido':'Sin correos nuevos: ya estaban todos'));
   return n;
 }
 async function leerBarridos(){
@@ -3435,10 +3440,48 @@ async function leerBarridos(){
       try{ nuevos+=ingerirBarrido(JSON.parse(await (await ent.getFile()).text())); }catch(e){ fallos++; }
     }
   }catch(e){ toast('El navegador no me dejó leer la carpeta. Usa «Cargar un archivo».'); return 0; }
-  if(nuevos){ snap('leer barridos'); save(); }
-  toast(archivos?(archivos+' barrido(s) · '+nuevos+' correo(s) nuevo(s)'+(fallos?' · '+fallos+' ilegible(s)':'')):'La carpeta correos está vacía');
+  if(nuevos){ snap('leer barridos');
+    if(S.autoAplicar!==false){ const r=procesarAuto();
+      toast(archivos+' barrido(s) · '+nuevos+' leídos · '+resumenAuto(r)); }
+    else toast(archivos+' barrido(s) · '+nuevos+' correo(s) nuevo(s)');
+    save(); }
+  else toast(archivos?'Sin correos nuevos':'La carpeta correos está vacía');
   return nuevos;
 }
+
+
+/* ============================================================
+   PROCESO AUTOMÁTICO
+   Se aplica solo lo que no requiere criterio: fechas de contacto,
+   bitácora y cierre de esperas. Lo que exige decidir —una cuenta
+   desconocida, un folio que no existe— queda esperándote.
+   ============================================================ */
+function esInterno(m){
+  const dom=d=>String(d||'').split('@')[1]||'';
+  const todos=[m.de,...(m.para||[])].map(dom).filter(Boolean);
+  return todos.length>0&&todos.every(d=>INTERNOS.includes(d));
+}
+function procesarAuto(){
+  const res={aplicados:0,descartados:0,quedan:0,cotiz:0};
+  const pend=[...(S.correos||[])];
+  pend.forEach(m=>{
+    const p=propuesta(m);
+    if(p.nuevos.length){ res.cotiz++; return; }              // folio nuevo: decide él
+    if(p.cuenta){ aplicarCorreo(m,p); res.aplicados++; return; }
+    if(S.autoDescartarInternos&&esInterno(m)&&!p.folios.length){ descartarCorreo(m); res.descartados++; return; }
+  });
+  res.quedan=(S.correos||[]).length;
+  return res;
+}
+function resumenAuto(r){
+  const p=[];
+  if(r.aplicados)p.push(r.aplicados+' aplicados');
+  if(r.descartados)p.push(r.descartados+' internos descartados');
+  if(r.cotiz)p.push(r.cotiz+' con folio sin registrar');
+  if(r.quedan)p.push(r.quedan+' esperando tu decisión');
+  return p.join(' · ')||'nada que hacer';
+}
+
 
 /* qué propone el panel para cada correo */
 function propuesta(m){
@@ -3502,6 +3545,16 @@ VIEWS.bandeja=function(v){
     el('span',{class:'sp'}),
     el('button',{class:'b',onclick:()=>leerBarridos().then(()=>render())},'Buscar barridos nuevos'),
     botonCargarArchivo(),
+    el('button',{class:'b','aria-pressed':S.autoAplicar!==false?'true':'false',
+      title:'Al cargar un barrido, aplica solo lo que no requiere criterio: fechas de contacto, bitácora y cierre de esperas',
+      onclick:()=>mut('modo automático',()=>{S.autoAplicar=(S.autoAplicar===false);})},
+      S.autoAplicar!==false?'Automático activado':'Automático apagado'),
+    el('button',{class:'b','aria-pressed':S.autoDescartarInternos?'true':'false',
+      title:'Descarta solo los correos entre direcciones de ACMA y Acmanet que no mencionen ningún folio',
+      onclick:()=>mut('descarte de internos',()=>{S.autoDescartarInternos=!S.autoDescartarInternos;})},
+      S.autoDescartarInternos?'Internos: descartar':'Internos: revisar'),
+    todos.length?el('button',{class:'b',onclick:()=>{
+      mut('procesar ahora',()=>{const r=procesarAuto();toast(resumenAuto(r));});}},'Procesar ahora'):null,
     conCuenta.length?el('button',{class:'b pri',onclick:async()=>{
       if(!await confirmar('Aplicar '+conCuenta.length+' correos reconocidos: actualiza fechas de contacto, escribe la bitácora y cierra las tareas de espera que correspondan.','Aplicar todo'))return;
       mut('aplicar bandeja',()=>conCuenta.forEach(x=>aplicarCorreo(x.m,x.p)));
