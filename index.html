@@ -515,6 +515,8 @@ svg .grid{stroke:var(--linea);stroke-width:1}
 <script>
 /* ============ utilidades ============ */
 const $ = (s,r=document)=>r.querySelector(s);
+/* append seguro: el append nativo del DOM convierte null en el texto "null" */
+const ap=(n,...k)=>{k.flat().forEach(c=>{ if(c!==null&&c!==undefined&&c!==false)n.append(c.nodeType?c:document.createTextNode(c)); });return n;};
 const el=(t,a={},...k)=>{const n=document.createElement(t);for(const[p,v]of Object.entries(a)){
   if(p==='class')n.className=v;else if(p==='html')n.innerHTML=v;else if(p.startsWith('on'))n.addEventListener(p.slice(2),v);
   else if(v!==null&&v!==undefined&&v!==false)n.setAttribute(p,v);}
@@ -715,6 +717,7 @@ function migrar(st){
   st.version=4;
   st.tareas=st.tareas||[];
   st.proyectos=st.proyectos||[];
+  st.correos=st.correos||[]; st.vistos=st.vistos||[];
   st.proyectos.forEach(p=>{ if(p.lat===undefined)p.lat=''; if(p.lng===undefined)p.lng=''; });
   st.cuentas=st.cuentas||[];
   st.cuentas.forEach(c=>{
@@ -1364,6 +1367,9 @@ function xlsxBlob(){
   hoja('TAREAS',[['Cuenta',t=>t.cuenta],['Tarea',t=>t.texto],['Tipo',t=>t.tipo],['Fecha',t=>t.fecha],
     ['Hecha',t=>t.hecha?'sí':''],['Cerrada el',t=>t.hechaTs||''],['Folio',t=>t.folio||'']],S.tareas);
   hoja('BITACORA',[['Fecha',b=>b.ts],['Cuenta',b=>b.cuenta],['Tipo',b=>b.tipo],['Registro',b=>b.texto]],S.bitacora);
+  hoja('CORREOS',[['Fecha',m=>m.fecha],['Dirección',m=>m.dir==='out'?'enviado':'recibido'],['De',m=>m.de],
+    ['Para',m=>(m.para||[]).join('; ')],['Asunto',m=>m.asunto],['Adjuntos',m=>m.adjuntos?'sí':''],
+    ['Resumen',m=>m.resumen]],S.correos||[]);
   return new Blob([XLSX.write(wb,{bookType:'xlsx',type:'array'})],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
 }
 function descargarRespaldo(){
@@ -1764,6 +1770,7 @@ const ICO={
   cartera:'M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z',
   numeros:'M4 20V10M10 20V4M16 20v-7M22 20H2',
   cotizar:'M8 3h8a2 2 0 012 2v14a2 2 0 01-2 2H8a2 2 0 01-2-2V5a2 2 0 012-2zM9 7h6M9 11h6M9 15h3',
+  bandeja:'M3 7l9 6 9-6M3 7a2 2 0 012-2h14a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2z',
   carpeta:'M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z',
   deshacer:'M3 10h11a5 5 0 010 10h-3M3 10l4-4M3 10l4 4'
 };
@@ -1773,7 +1780,7 @@ const svgIco=(d,s=19)=>{const n=document.createElementNS('http://www.w3.org/2000
   n.setAttribute('stroke-linecap','round');n.setAttribute('stroke-linejoin','round');
   const p=document.createElementNS('http://www.w3.org/2000/svg','path');p.setAttribute('d',d);n.append(p);return n;};
 
-const SECCIONES=[['hoy','Hoy'],['cartera','Cartera'],['numeros','Números'],['cotizar','Cotizar']];
+const SECCIONES=[['hoy','Hoy'],['cartera','Cartera'],['bandeja','Bandeja'],['numeros','Números'],['cotizar','Cotizar']];
 
 function irA(ruta,reemplazar){
   const h=(ruta.v==='cuenta'||ruta.v==='proyecto')?('#/'+ruta.v+'/'+encodeURIComponent(ruta.id)):('#/'+ruta.v);
@@ -1784,7 +1791,7 @@ function leerRuta(){
   const h=(location.hash||'#/hoy').replace(/^#\/?/,'').split('/');
   if(h[0]==='cuenta'&&h[1])return {v:'cuenta',id:decodeURIComponent(h[1])};
   if(h[0]==='proyecto'&&h[1])return {v:'proyecto',id:decodeURIComponent(h[1])};
-  const v=['hoy','cartera','numeros','cotizar'].includes(h[0])?h[0]:'hoy';
+  const v=['hoy','cartera','bandeja','numeros','cotizar'].includes(h[0])?h[0]:'hoy';
   return {v};
 }
 window.addEventListener('hashchange',()=>{ if(!S)return; UI.ruta=leerRuta(); UI.sel.clear(); render(); });
@@ -1824,6 +1831,7 @@ function pintaRail(){
 }
 function insignia(k){
   if(k==='hoy')return S.tareas.filter(t=>!t.hecha&&dias(t.fecha)!==null&&dias(t.fecha)<=0).length||'';
+  if(k==='bandeja')return (S.correos||[]).length||'';
   if(k==='numeros')return checks().filter(c=>c.sev==='alta'&&c.items.length).length||'';
   return '';
 }
@@ -1860,7 +1868,7 @@ function pintaBarra(){
     if(UI.openCot){ const q=S.cotizaciones.find(x=>x.qid===UI.openCot);
       if(q)mig.append(el('span',{class:'fl'},'›'),el('span',{style:'font-family:var(--m);font-size:12.5px'},folioRev(q))); }
   }else{
-    mig.append(el('span',{class:'actual'},({hoy:'Hoy',cartera:'Cartera',numeros:'Números',cotizar:'Cotizar'})[r.v]));
+    mig.append(el('span',{class:'actual'},({hoy:'Hoy',cartera:'Cartera',bandeja:'Bandeja',numeros:'Números',cotizar:'Cotizar'})[r.v]));
     if(r.v==='hoy')mig.append(el('span',{class:'tx2',style:'margin-left:8px'},
       HOY.toLocaleDateString('es-CL',{weekday:'long',day:'numeric',month:'long'})));
   }
@@ -2019,7 +2027,7 @@ function carril(q,modo){
     const cls='nodo '+(i<idx?'ok':i===idx?(tr?'trabado':'aqui'):'');
     const fh=modo==='ejecucion'?q.hitos?.[HITO[e]]:null;
     const nd=el('div',{class:cls});
-    nd.append(el('div',{class:'barra'}),el('span',{class:'pt'}),
+    ap(nd,el('div',{class:'barra'}),el('span',{class:'pt'}),
       el('div',{class:'et'},e),fh?el('div',{class:'fh'},fdate(fh)):null);
     nd.title=(i===idx?'Está aquí · ':'')+e;
     if(modo==='ejecucion'&&i!==idx)nd.style.cursor='pointer',nd.onclick=()=>setEjecucion(q,e);
@@ -2669,7 +2677,7 @@ function via(q){
   if(fuera)pie.append(pill(q.estado==='Perdida'?'r':'g',q.estado),
     el('span',{},q.estado==='Perdida'?(q.motivoPerdida||'sin motivo registrado'):'fuera del flujo normal'),
     el('span',{style:'flex:1'}),el('button',{class:'b xs',onclick:()=>setEstadoCot(q,'Enviada')},'Devolver al flujo'));
-  else pie.append(el('span',{},'Clic en una etapa para moverla.'),el('span',{style:'flex:1'}),
+  else ap(pie,el('span',{},'Clic en una etapa para moverla.'),el('span',{style:'flex:1'}),
     q.estado!=='Adjudicada'?el('button',{class:'b xs',onclick:()=>marcarPerdida(q)},'Marcar perdida'):null,
     q.estado!=='En pausa'?el('button',{class:'b xs',onclick:()=>setEstadoCot(q,'En pausa')},'Pausar'):null);
   return el('div',{},barra,pie);
@@ -2680,7 +2688,7 @@ function viaEjecucion(q){
   EJEC.forEach((e,i)=>{
     const cls='h '+(i<idx?'ok':i===idx?'aqui':'');
     const fh=q.hitos?.[HITO[e]];
-    barra.append(el('div',{class:cls},el('div',{class:'ln'}),
+    ap(barra,el('div',{class:cls},el('div',{class:'ln'}),
       el('button',{onclick:()=>setEjecucion(q,e),title:'Mover a "'+e+'"'},
         el('div',{class:'nn'},'E'+(i+1)),el('div',{class:'tt'},e),
         fh?el('div',{class:'fh'},fdate(fh)):null)));
@@ -3336,6 +3344,245 @@ function docCotizacion(q){
   return w;
 }
 
+/* ============================================================
+   BANDEJA DE CORREO
+   El flujo alimenta, el panel propone, tú confirmas. Nunca al revés:
+   un CRM que se actualiza solo desde el correo miente peor que uno
+   desactualizado, porque no sabes en qué dejó de ser cierto.
+   ============================================================ */
+const RX_FOLIO=/\bBB\s?2026[\s\-_]?(\d{3})\b/gi;
+function foliosEn(txt){
+  const s=String(txt||'').toUpperCase(); const out=new Set(); let m;
+  RX_FOLIO.lastIndex=0;
+  while((m=RX_FOLIO.exec(s))!==null)out.add('BB2026-'+m[1]);
+  return [...out];
+}
+function correoDe(x){
+  if(!x)return '';
+  if(typeof x==='string')return (x.match(/[\w.\-+]+@[\w.\-]+/)||[''])[0].toLowerCase();
+  if(x.emailAddress)return String(x.emailAddress.address||'').toLowerCase();
+  if(x.address)return String(x.address).toLowerCase();
+  return '';
+}
+function correosDe(x){
+  if(!x)return [];
+  if(Array.isArray(x))return x.map(correoDe).filter(Boolean);
+  const u=correoDe(x); return u?[u]:[];
+}
+const INTERNOS=['acma.cl','acmanet.cl','inchalam.cl'];
+function cuentaPorCorreo(dirs){
+  for(const d of dirs){
+    const dom=d.split('@')[1]||'';
+    if(!dom||INTERNOS.includes(dom))continue;
+    let c=S.cuentas.find(x=>(x.email||'').toLowerCase()===d);
+    if(c)return c;
+    const p=S.contactos.find(x=>(x.email||'').toLowerCase()===d);
+    if(p){ c=cuenta(p.cuenta); if(c)return c; }
+    c=S.cuentas.find(x=>(x.email||'').toLowerCase().split('@')[1]===dom);
+    if(c)return c;
+    const p2=S.contactos.find(x=>(x.email||'').toLowerCase().split('@')[1]===dom);
+    if(p2){ c=cuenta(p2.cuenta); if(c)return c; }
+  }
+  return null;
+}
+
+async function leerBarridos(){
+  if(!DIR){ toast('No hay carpeta conectada'); return 0; }
+  const h=await subcarpeta(D_MAIL,false);
+  if(!h){ toast('Todavía no existe la carpeta correos'); return 0; }
+  S.correos=S.correos||[]; S.vistos=S.vistos||[];
+  const yaTengo=new Set([...S.correos.map(x=>x.id),...S.vistos]);
+  let nuevos=0, archivos=0;
+  try{
+    for await(const [nom,ent] of h.entries()){
+      if(ent.kind!=='file'||!/\.json$/i.test(nom))continue;
+      archivos++;
+      let j; try{ j=JSON.parse(await (await ent.getFile()).text()); }catch(e){ continue; }
+      const meter=(arr,dir)=>{ (arr||[]).forEach(m=>{
+        const id=String(m.id||m.internetMessageId||(m.asunto+m.fecha));
+        if(!id||yaTengo.has(id))return; yaTengo.add(id);
+        S.correos.push({id,dir,
+          de:correoDe(m.de||m.from),
+          para:correosDe(m.para||m.toRecipients),
+          asunto:String(m.asunto||m.subject||''),
+          fecha:String(m.fecha||m.receivedDateTime||m.sentDateTime||'').slice(0,10),
+          resumen:String(m.resumen||m.bodyPreview||'').slice(0,600),
+          adjuntos:!!(m.adjuntos||m.hasAttachments)});
+        nuevos++; }); };
+      meter(j.recibidos,'in'); meter(j.enviados,'out');
+    }
+  }catch(e){ toast('No pude leer la carpeta correos'); return 0; }
+  S.correos.sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||''));
+  save();
+  toast(archivos+' barrido(s) leído(s) · '+nuevos+' correo(s) nuevo(s)');
+  return nuevos;
+}
+
+/* qué propone el panel para cada correo */
+function propuesta(m){
+  const c=cuentaPorCorreo(m.dir==='out'?m.para:[m.de]);
+  const folios=foliosEn(m.asunto+' '+m.resumen);
+  const cots=folios.map(f=>S.cotizaciones.find(q=>q.folio===f)).filter(Boolean);
+  const nuevos=folios.filter(f=>!S.cotizaciones.some(q=>q.folio===f));
+  const esperando=c?abiertas(c.nombre).filter(t=>t.tipo==='esperando'&&
+    (!t.folio||folios.includes(t.folio))):[];
+  return {cuenta:c,folios,cots,nuevos,esperando};
+}
+function aplicarCorreo(m,p){
+  const c=p.cuenta; if(!c)return false;
+  if(m.dir==='out'){ if((c.ultMio||'')<m.fecha){c.ultMio=m.fecha;c.hablo='Benjamín';} }
+  else { if((c.ultSuyo||'')<m.fecha){c.ultSuyo=m.fecha;c.hablo='cliente';}
+    if(['NUNCA CONTACTADO','SIN DATOS DE CONTACTO','CONTACTADO SIN RESPUESTA'].includes(c.canal))c.canal='EN NEGOCIACIÓN'; }
+  logB(c.nombre,'correo',(m.dir==='out'?'Enviado: ':'Recibido de '+m.de+': ')+m.asunto,m.fecha);
+  if(m.dir==='in')p.esperando.forEach(t=>{ t.hecha=true; t.hechaTs=m.fecha;
+    logB(c.nombre,'tarea','Cerrada por respuesta del cliente: '+t.texto,m.fecha); });
+  S.vistos=S.vistos||[]; S.vistos.push(m.id);
+  S.correos=S.correos.filter(x=>x.id!==m.id);
+  return true;
+}
+function descartarCorreo(m){
+  S.vistos=S.vistos||[]; S.vistos.push(m.id);
+  S.correos=S.correos.filter(x=>x.id!==m.id);
+}
+
+VIEWS.bandeja=function(v){
+  const w=el('div',{class:'ancho rej'});
+  S.correos=S.correos||[]; S.vistos=S.vistos||[];
+  const todos=S.correos.map(m=>({m,p:propuesta(m)}));
+  const conCuenta=todos.filter(x=>x.p.cuenta);
+  const sinCuenta=todos.filter(x=>!x.p.cuenta);
+  const conFolioNuevo=todos.filter(x=>x.p.nuevos.length);
+
+  w.append(el('div',{class:'cifras jer'},
+    cifra('Correos por revisar',String(todos.length),
+      conCuenta.length+' reconocidos · '+sinCuenta.length+' sin cuenta','hero'),
+    cifra('Cotizaciones sin registrar',String(new Set(conFolioNuevo.flatMap(x=>x.p.nuevos)).size),
+      'folios que aparecen en el correo y no están en el CRM',conFolioNuevo.length?'ml':'ok'),
+    cifra('Respuestas de clientes',String(todos.filter(x=>x.m.dir==='in'&&x.p.cuenta).length),
+      todos.filter(x=>x.p.esperando.length).length+' cierran una tarea de espera'),
+    cifra('Ya procesados',String(S.vistos.length),'no vuelven a aparecer','ok')));
+
+  const barra=el('div',{class:'c'});
+  ap(barra,el('header',{},el('h3',{},'Bandeja'),
+    el('span',{class:'mi'},DIR?('lee Cartera BB/correos de '+DIR.name):'sin carpeta conectada'),
+    el('span',{class:'sp'}),
+    el('button',{class:'b',onclick:()=>leerBarridos().then(()=>render())},'Buscar barridos nuevos'),
+    conCuenta.length?el('button',{class:'b pri',onclick:async()=>{
+      if(!await confirmar('Aplicar '+conCuenta.length+' correos reconocidos: actualiza fechas de contacto, escribe la bitácora y cierra las tareas de espera que correspondan.','Aplicar todo'))return;
+      mut('aplicar bandeja',()=>conCuenta.forEach(x=>aplicarCorreo(x.m,x.p)));
+      toast(conCuenta.length+' correos aplicados');}},'Aplicar los '+conCuenta.length+' reconocidos'):null,
+    S.vistos.length?el('button',{class:'b sutil',onclick:async()=>{
+      if(!await confirmar('Olvidar los '+S.vistos.length+' correos ya procesados. Van a volver a aparecer en el próximo barrido.','Olvidar'))return;
+      mut('limpiar vistos',()=>{S.vistos=[];});}},'Olvidar procesados'):null));
+  w.append(barra);
+
+  if(!todos.length){
+    w.append(el('div',{class:'c'},vacio(ICO.cotizar,
+      DIR?'No hay correos por revisar':'Conecta la carpeta primero',
+      DIR?'Cuando el flujo de Power Automate escriba un barrido en Cartera BB/correos, apreta «Buscar barridos nuevos» y los correos aparecen aquí para que los confirmes uno a uno o en bloque.':'',
+      el('button',{class:'b pri',onclick:()=>leerBarridos().then(()=>render())},'Buscar barridos nuevos'))));
+    v.append(w); return;
+  }
+
+  const grupo=(titulo,arr,ayuda)=>{
+    if(!arr.length)return;
+    const c=el('div',{class:'c'});
+    ap(c,el('header',{},el('h3',{},titulo),el('span',{class:'co'},String(arr.length)),
+      ayuda?el('span',{class:'mi'},ayuda):null));
+    arr.slice(0,60).forEach(({m,p})=>c.append(filaCorreo(m,p)));
+    if(arr.length>60)c.append(el('div',{class:'mi',style:'padding:10px var(--s4)'},
+      'Se muestran 60 de '+arr.length+'. Aplica o descarta estos y aparecen los siguientes.'));
+    w.append(c);
+  };
+  grupo('Cotizaciones que aparecen en el correo y no están en el CRM',conFolioNuevo,
+    'esto es la auditoría: enviaste la oferta y nunca quedó registrada');
+  grupo('Reconocidos',conCuenta.filter(x=>!x.p.nuevos.length),
+    'el remitente calza con una cuenta de tu cartera');
+  grupo('Sin cuenta reconocida',sinCuenta,
+    'o no es de un cliente, o falta cargar ese correo en la ficha');
+  v.append(w);
+};
+
+function filaCorreo(m,p){
+  const w=el('div',{class:'tk'});
+  const ico=m.dir==='out'?pill('a','enviado'):pill('v','recibido');
+  const bd=el('div',{class:'bd'});
+  bd.append(el('div',{class:'tx',style:'font-weight:600'},m.asunto||'(sin asunto)'));
+  const mt=el('div',{class:'mt'});
+  ap(mt,ico,el('span',{},fdate(m.fecha)),
+    el('span',{class:'num',style:'font-size:11px'},m.dir==='out'?(m.para[0]||'—'):m.de),
+    m.adjuntos?pill('g','con adjunto'):null);
+  if(p.cuenta)mt.append(el('button',{class:'lk',style:'font-size:11.5px',onclick:()=>abrir(p.cuenta.nombre)},p.cuenta.nombre));
+  p.cots.forEach(q=>ap(mt,el('button',{class:'lk',style:'font-size:11.5px',
+    onclick:()=>{UI.openCot=q.qid;if(q.proyecto)irA({v:'proyecto',id:q.proyecto});else abrir(q.cuenta,'proyectos');}},folioRev(q))));
+  p.nuevos.forEach(f=>ap(mt,pill('r',f+' no registrada')));
+  bd.append(mt);
+  if(m.resumen)bd.append(el('div',{class:'tx2',style:'margin-top:4px;max-width:760px'},
+    m.resumen.slice(0,220)+(m.resumen.length>220?'…':'')));
+  if(p.cuenta){
+    const acc=[];
+    acc.push(m.dir==='out'?'marcar «le escribí» el '+fdate(m.fecha):'marcar «me respondió» el '+fdate(m.fecha));
+    acc.push('anotar en la bitácora');
+    if(m.dir==='in'&&p.esperando.length)acc.push('cerrar '+p.esperando.length+' tarea(s) de espera');
+    bd.append(el('div',{class:'mi',style:'margin-top:4px;color:var(--acc)'},'Al aplicar: '+acc.join(' · ')));
+  }
+  w.append(bd);
+  const ac=el('div',{class:'ac'});
+  if(p.nuevos.length)ap(ac,el('button',{class:'b xs pri',onclick:()=>crearDesdeCorreo(m,p)},
+    'Registrar '+p.nuevos[0]));
+  if(p.cuenta)ap(ac,el('button',{class:'b xs'+(p.nuevos.length?'':' pri'),
+    onclick:()=>mut('aplicar correo',()=>aplicarCorreo(m,p))},'Aplicar'));
+  else ap(ac,el('button',{class:'b xs',onclick:()=>asignarCuenta(m)},'Asignar cuenta'));
+  ap(ac,el('button',{class:'b xs sutil',onclick:()=>mut('descartar correo',()=>descartarCorreo(m))},'Descartar'));
+  w.append(ac);
+  return w;
+}
+
+async function asignarCuenta(m){
+  const dir=m.dir==='out'?(m.para[0]||''):m.de;
+  const r=await ask('¿De qué cuenta es este correo?',[
+    {k:'cuenta',label:'Cuenta',type:'select',options:['— ninguna, descartar —',...activas().map(c=>c.nombre)],value:'— ninguna, descartar —'},
+    {k:'guardar',label:'¿Guardar '+dir+' como contacto de esa cuenta?',type:'select',options:['Sí','No'],value:'Sí'}],'Asignar');
+  if(!r)return;
+  if(r.cuenta.startsWith('—')){ mut('descartar correo',()=>descartarCorreo(m)); return; }
+  mut('asignar cuenta al correo',()=>{
+    if(r.guardar==='Sí'&&dir&&!S.contactos.some(x=>(x.email||'').toLowerCase()===dir))
+      S.contactos.push({pid:uid(),cuenta:r.cuenta,nombre:dir.split('@')[0].replace(/[._]/g,' '),
+        cargo:'',email:dir,tel:'',rol:'Influye',nota:'Detectado en el barrido de correo del '+fdate(m.fecha)});
+    aplicarCorreo(m,{...propuesta(m),cuenta:cuenta(r.cuenta),esperando:abiertas(r.cuenta).filter(t=>t.tipo==='esperando')});
+  });
+  toast('Aplicado a '+r.cuenta);
+}
+async function crearDesdeCorreo(m,p){
+  const folio=p.nuevos[0];
+  const cn=p.cuenta?p.cuenta.nombre:activas()[0]?.nombre;
+  const proys=proyectosDe(cn);
+  const r=await ask('Registrar '+folio+' desde el correo',[
+    {k:'cuenta',label:'Cuenta',type:'select',options:activas().map(c=>c.nombre),value:cn},
+    {k:'proyecto',label:'Obra',type:'select',options:['— crear proyecto nuevo —',...proys.map(x=>x.nombre)],
+     value:proys[0]?proys[0].nombre:'— crear proyecto nuevo —'},
+    {k:'obra',label:'Alcance',value:m.asunto.replace(/cotizaci[oó]n\s*/i,'').slice(0,90)},
+    {k:'neto',label:'Neto (déjalo en 0 si aún no lo sabes)',type:'number',value:0},
+    {k:'validez',label:'Válida hasta',type:'date',value:iso(new Date((pd(m.fecha)||HOY).getTime()+15*864e5))}],'Registrar');
+  if(!r)return;
+  let pr=S.proyectos.find(x=>x.cuenta===r.cuenta&&x.nombre===r.proyecto);
+  if(!pr){ pr=await crearProyecto(r.cuenta); if(!pr)return; }
+  mut('registrar cotización desde el correo',()=>{
+    const c=cuenta(r.cuenta);
+    S.cotizaciones.unshift({qid:uid(),folio,rev:0,versiones:[],fecha:m.fecha||iso(HOY),cuenta:r.cuenta,
+      proyecto:pr.pid,obra:r.obra,contacto:c?.contacto||'',email:m.dir==='out'?(m.para[0]||''):m.de,
+      emailContacto:m.dir==='out'?(m.para[0]||''):m.de,rut:'',producto:'',neto:Number(r.neto)||0,kg:null,
+      validez:r.validez,estado:'Enviada',prob:null,probManual:false,oc:'',
+      nota:'Registrada desde el barrido de correo del '+fdate(m.fecha)+'. Falta cargar el detalle: «'+m.asunto+'»',
+      cierre:'',motivoPerdida:'',lineas:[],cond:JSON.parse(JSON.stringify(COND_DEF)),
+      ejecucion:'',hitos:{oc:'',ingreso:'',programa:'',despacho:'',entrega:'',factura:''},
+      ingreso:{calendario:'',precioKilo:null,direccion:'',contactoObra:'',segmento:'',camiones:''},incidencias:[]});
+    nuevaTarea(r.cuenta,'Cargar el detalle de '+folio+' (líneas, kilos y neto)',iso(HOY),'mio',folio);
+    aplicarCorreo(m,propuesta(m));
+  });
+  toast(folio+' registrada, con tarea para cargarle el detalle');
+}
+
 /* ============ PALETA DE COMANDOS ============
    La superficie completa del sistema vive acá: toda acción es alcanzable
    escribiendo. La barra visible se queda con cinco cosas. */
@@ -3358,6 +3605,7 @@ function cmdk(){
       {k:'ir a',n:'Hoy',s:'tu jornada',go:()=>irA({v:'hoy'})},
       {k:'ir a',n:'Cartera',s:'cuentas, proyectos, embudo y personas',go:()=>irA({v:'cartera'})},
       {k:'ir a',n:'Números',s:'gráficos y salud del dato',go:()=>irA({v:'numeros'})},
+      {k:'ir a',n:'Bandeja',s:'correos por revisar',go:()=>irA({v:'bandeja'})},
       {k:'ir a',n:'Cotizar',s:'el cotizador ACMA',go:()=>abrirCotizador(cn?{cuenta:cn}:null)},
       {k:'vista',n:'Tabla de cuentas',s:'',go:()=>{UI.vista='tabla';irA({v:'cartera'});}},
       {k:'vista',n:'Malla de la cartera',s:'',go:()=>{UI.vista='malla';irA({v:'cartera'});}},
@@ -3368,6 +3616,7 @@ function cmdk(){
        go:()=>{UI.densidad=UI.densidad==='compacta'?'comoda':'compacta';render();}},
       {k:'filtro',n:'Solo prioridad A',s:'',go:()=>{UI.fA={prio:'A - Alta',canal:'',seg:'',txt:'',arch:false};UI.vista='tabla';irA({v:'cartera'});}},
       {k:'filtro',n:'Nunca contactadas',s:'',go:()=>{UI.fA={prio:'',canal:'NUNCA CONTACTADO',seg:'',txt:'',arch:false};UI.vista='tabla';irA({v:'cartera'});}},
+      {k:'datos',n:'Buscar barridos de correo nuevos',s:'lee Cartera BB/correos',go:()=>leerBarridos().then(()=>render())},
       {k:'datos',n:'Descargar respaldo en Excel',s:'',go:descargarRespaldo},
       {k:'datos',n:'Guardar ahora en la carpeta',s:'',go:()=>guardarEnCarpeta().then(()=>toast('Guardado'))},
       {k:'datos',n:'Deshacer el último cambio',s:UNDO.length?UNDO[UNDO.length-1].d:'nada que deshacer',go:undo},
@@ -3488,7 +3737,7 @@ document.addEventListener('keydown',e=>{
   if(e.key==='n'||e.key==='N'){e.preventDefault();crearCuenta();}
   if(e.key==='/'){e.preventDefault();cmdk();}
   if(e.key==='1'){irA({v:'hoy'});} if(e.key==='2'){irA({v:'cartera'});}
-  if(e.key==='3'){irA({v:'numeros'});} if(e.key==='4'){irA({v:'cotizar'});}
+  if(e.key==='3'){irA({v:'bandeja'});} if(e.key==='4'){irA({v:'numeros'});} if(e.key==='5'){irA({v:'cotizar'});}
 });
 window.addEventListener('beforeunload',()=>{ if(saveT)guardarEnCarpeta(); });
 boot();
