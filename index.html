@@ -1898,6 +1898,7 @@ function menuNuevo(anchor){
       {txt:'Cotizador',fn:()=>abrirCotizador(cn?{cuenta:cn}:null)},
       {txt:'Buscar en todo',tecla:'Ctrl+K',fn:cmdk}]},
     {titulo:'Datos',items:[
+      {txt:'Aplicar cambios en bloque',fn:vistaLote},
       {txt:'Descargar respaldo en Excel',fn:descargarRespaldo},
       {txt:'Guardar ahora',tecla:'Ctrl+S',fn:()=>guardarEnCarpeta().then(()=>toast('Guardado'))}]}]);
 }
@@ -3553,6 +3554,7 @@ VIEWS.bandeja=function(v){
       title:'Descarta solo los correos entre direcciones de ACMA y Acmanet que no mencionen ningún folio',
       onclick:()=>mut('descarte de internos',()=>{S.autoDescartarInternos=!S.autoDescartarInternos;})},
       S.autoDescartarInternos?'Internos: descartar':'Internos: revisar'),
+    el('button',{class:'b',onclick:vistaLote,title:'Pega un JSON de operaciones y aplica todo de una vez'},'Aplicar en bloque'),
     todos.length?el('button',{class:'b',onclick:()=>{
       mut('procesar ahora',()=>{const r=procesarAuto();toast(resumenAuto(r));});}},'Procesar ahora'):null,
     conCuenta.length?el('button',{class:'b pri',onclick:async()=>{
@@ -3672,6 +3674,216 @@ async function crearDesdeCorreo(m,p){
   toast(folio+' registrada, con tarea para cargarle el detalle');
 }
 
+/* ============================================================
+   IMPORTADOR EN BLOQUE
+   Una sola entrada de datos para todo: cuentas, personas, proyectos,
+   cotizaciones con sus líneas y condiciones, tareas y notas.
+   Siempre con vista previa antes de tocar nada, y siempre reversible.
+   Pensado para que un asistente genere el lote y tú solo lo revises.
+   ============================================================ */
+const OPS=['cuenta','contacto','proyecto','cotizacion','tarea','nota','ejecucion'];
+
+function normalizarLote(txt){
+  let j;
+  try{ j=JSON.parse(txt); }
+  catch(e){ throw new Error('No es JSON válido: '+e.message); }
+  if(Array.isArray(j))j={operaciones:j};
+  if(!j||!Array.isArray(j.operaciones))throw new Error('Falta la lista "operaciones".');
+  const malas=j.operaciones.filter(o=>!o||!OPS.includes(o.op));
+  if(malas.length)throw new Error(malas.length+' operación(es) con "op" desconocido. Válidos: '+OPS.join(', '));
+  return j;
+}
+
+/* qué haría cada operación, sin ejecutarla */
+function planLote(j){
+  const plan=[], nuevasCuentas=new Set(), nuevosProy=new Set();
+  const existeCuenta=n=>!!cuenta(n)||nuevasCuentas.has(norm(n));
+  const existeProy=(cn,n)=>S.proyectos.some(p=>p.cuenta===cn&&norm(p.nombre)===norm(n))||nuevosProy.has(norm(cn)+'|'+norm(n));
+  j.operaciones.forEach((o,i)=>{
+    const r={i,op:o.op,accion:'',detalle:'',aviso:''};
+    if(o.op==='cuenta'){
+      r.accion=existeCuenta(o.nombre)?'actualiza':'crea';
+      r.detalle=o.nombre; nuevasCuentas.add(norm(o.nombre));
+    }
+    if(o.op==='contacto'){
+      const ya=S.contactos.some(p=>p.cuenta===o.cuenta&&norm(p.nombre)===norm(o.nombre));
+      r.accion=ya?'actualiza':'crea'; r.detalle=o.nombre+' → '+o.cuenta;
+      if(!existeCuenta(o.cuenta))r.aviso='la cuenta no existe todavía';
+    }
+    if(o.op==='proyecto'){
+      r.accion=existeProy(o.cuenta,o.nombre)?'actualiza':'crea';
+      r.detalle=o.nombre+' → '+o.cuenta; nuevosProy.add(norm(o.cuenta)+'|'+norm(o.nombre));
+      if(!existeCuenta(o.cuenta))r.aviso='la cuenta no existe todavía';
+    }
+    if(o.op==='cotizacion'){
+      const q=S.cotizaciones.find(x=>x.folio===o.folio&&(!o.cuenta||x.cuenta===o.cuenta));
+      r.accion=q?'actualiza':'crea';
+      const n=(o.lineas||[]).reduce((a,l)=>a+(Number(l.kg)||0)*(Number(l.precioKg)||0)+(Number(l.monto)||0),0);
+      r.detalle=o.folio+' · '+(o.cuenta||'?')+(n?' · '+money(n):'');
+      if(o.neto&&n&&Math.abs(o.neto-n)>Math.max(1000,o.neto*0.005))
+        r.aviso='el neto declarado ('+money(o.neto)+') no cuadra con las líneas ('+money(n)+')';
+      if(!o.lineas||!o.lineas.length)r.aviso=(r.aviso?r.aviso+' · ':'')+'sin líneas de producto';
+      const dup=S.cotizaciones.filter(x=>x.folio===o.folio).length;
+      if(dup&&!q)r.aviso=(r.aviso?r.aviso+' · ':'')+'ese folio ya existe en otra cuenta';
+    }
+    if(o.op==='tarea'){ r.accion='crea'; r.detalle=String(o.texto||'').slice(0,64)+' → '+o.cuenta; }
+    if(o.op==='nota'){ r.accion='crea'; r.detalle=String(o.texto||'').slice(0,64)+' → '+o.cuenta; }
+    if(o.op==='ejecucion'){
+      const q=S.cotizaciones.find(x=>x.folio===o.folio);
+      r.accion=q?'actualiza':'no aplica'; r.detalle=o.folio+' → '+(o.estado||'');
+      if(!q)r.aviso='no existe esa cotización';
+    }
+    plan.push(r);
+  });
+  return plan;
+}
+
+function ejecutarLote(j){
+  const res={creados:0,actualizados:0,omitidos:0};
+  const pick=(o,ks)=>{const x={};ks.forEach(k=>{if(o[k]!==undefined)x[k]=o[k];});return x;};
+  j.operaciones.forEach(o=>{
+    if(o.op==='cuenta'){
+      let c=cuenta(o.nombre);
+      if(!c){
+        const ids=S.cuentas.map(x=>+String(x.id).replace(/\D/g,'')||0);
+        c={cid:uid(),id:o.id||('C'+String(Math.max(0,...ids)+1).padStart(2,'0')),nombre:o.nombre,seg:'',tipo:'Constructora',
+          grupo:'',contacto:'',cargo:'',email:'',tel:'',ultMio:'',ultSuyo:'',hablo:'nadie',
+          canal:'NUNCA CONTACTADO',prio:'B - Media',notas:'',archivada:false};
+        S.cuentas.push(c); res.creados++;
+      } else res.actualizados++;
+      Object.assign(c,pick(o,['seg','tipo','grupo','contacto','cargo','email','tel','canal','prio','notas','ultMio','ultSuyo','hablo']));
+    }
+    if(o.op==='contacto'){
+      let p=S.contactos.find(x=>x.cuenta===o.cuenta&&norm(x.nombre)===norm(o.nombre));
+      if(!p){ p={pid:uid(),cuenta:o.cuenta,nombre:o.nombre,cargo:'',email:'',tel:'',rol:'Influye',nota:''};
+        S.contactos.push(p); res.creados++; } else res.actualizados++;
+      Object.assign(p,pick(o,['cargo','email','tel','rol','nota']));
+    }
+    if(o.op==='proyecto'){
+      let p=S.proyectos.find(x=>x.cuenta===o.cuenta&&norm(x.nombre)===norm(o.nombre));
+      if(!p){ p={pid:uid(),cuenta:o.cuenta,nombre:o.nombre,comuna:'',direccion:'',mandante:'',
+        estado:'Activo',inicio:'',notas:'',lat:'',lng:''}; S.proyectos.push(p); res.creados++; }
+      else res.actualizados++;
+      Object.assign(p,pick(o,['comuna','direccion','mandante','estado','inicio','notas','lat','lng']));
+    }
+    if(o.op==='cotizacion'){
+      let pr=o.proyecto?S.proyectos.find(x=>x.cuenta===o.cuenta&&norm(x.nombre)===norm(o.proyecto)):null;
+      if(!pr&&o.proyecto){ pr={pid:uid(),cuenta:o.cuenta,nombre:o.proyecto,comuna:o.comuna||'',direccion:'',
+        mandante:'',estado:'Activo',inicio:'',notas:'',lat:'',lng:''}; S.proyectos.push(pr); res.creados++; }
+      let q=S.cotizaciones.find(x=>x.folio===o.folio&&(!o.cuenta||x.cuenta===o.cuenta));
+      if(!q){
+        q={qid:uid(),folio:o.folio,rev:o.rev||0,versiones:[],fecha:o.fecha||iso(HOY),cuenta:o.cuenta,
+          proyecto:pr?pr.pid:'',obra:o.obra||'',contacto:o.contacto||'',email:o.emailContacto||'',
+          emailContacto:o.emailContacto||'',rut:o.rut||'',producto:'',neto:0,kg:null,validez:o.validez||'',
+          estado:o.estado||'Enviada',prob:null,probManual:false,oc:o.oc||'',nota:o.nota||'',cierre:o.cierre||'',
+          motivoPerdida:'',lineas:[],cond:JSON.parse(JSON.stringify(COND_DEF)),ejecucion:'',
+          hitos:{oc:'',ingreso:'',programa:'',despacho:'',entrega:'',factura:''},
+          ingreso:{calendario:'',precioKilo:null,direccion:'',contactoObra:'',segmento:'',camiones:''},incidencias:[]};
+        S.cotizaciones.unshift(q); res.creados++;
+      } else res.actualizados++;
+      Object.assign(q,pick(o,['fecha','obra','contacto','emailContacto','rut','validez','estado','oc','nota','cierre','rev']));
+      if(pr)q.proyecto=pr.pid;
+      if(o.lineas&&o.lineas.length){
+        q.lineas=o.lineas.map(l=>({id:uid(),familia:l.familia||'Otro',producto:l.producto||'',
+          kg:l.kg??null,precioKg:l.precioKg??null,monto:l.monto??null}));
+        recalcNeto(q);
+      }
+      if(o.neto!==undefined&&(!o.lineas||!o.lineas.length))q.neto=Number(o.neto)||0;
+      if(o.kg!==undefined&&(!o.lineas||!o.lineas.length))q.kg=o.kg;
+      if(o.cond)Object.assign(q.cond,o.cond);
+      if(o.ingreso)Object.assign(q.ingreso,o.ingreso);
+    }
+    if(o.op==='tarea'){
+      nuevaTarea(o.cuenta,o.texto,o.fecha||iso(HOY),o.tipo||'mio',o.folio||''); res.creados++;
+    }
+    if(o.op==='nota'){ logB(o.cuenta,o.tipo||'nota',o.texto,o.ts); res.creados++; }
+    if(o.op==='ejecucion'){
+      const q=S.cotizaciones.find(x=>x.folio===o.folio);
+      if(!q){ res.omitidos++; return; }
+      if(o.estado)q.ejecucion=o.estado;
+      if(o.hitos)Object.assign(q.hitos,o.hitos);
+      if(o.ingreso)Object.assign(q.ingreso,o.ingreso);
+      if(o.oc)q.oc=o.oc;
+      res.actualizados++;
+    }
+  });
+  return res;
+}
+
+function vistaLote(){
+  document.querySelectorAll('.velo,.dlg').forEach(n=>n.remove());
+  const cerrar=()=>{sc.remove();mo.remove();};
+  const sc=el('div',{class:'velo',onclick:cerrar});
+  const mo=el('div',{class:'dlg',style:'width:min(860px,96vw)'});
+  mo.append(el('h3',{},'Aplicar cambios en bloque'));
+  mo.append(el('p',{class:'tx2',style:'margin:0 0 var(--s3)'},
+    'Pega aquí el JSON de operaciones. Verás exactamente qué se va a crear y qué se va a actualizar antes de tocar nada. Todo es reversible con Ctrl+Z.'));
+  const ta=el('textarea',{rows:'11',placeholder:'{ "operaciones": [ … ] }',
+    style:'font-family:var(--m);font-size:12px;width:100%;min-height:190px'});
+  mo.append(ta);
+  const zona=el('div',{style:'margin-top:var(--s3)'});
+  mo.append(zona);
+  const pie=el('div',{class:'ac'});
+  const bCerrar=el('button',{class:'b',onclick:cerrar},'Cerrar');
+  const bVer=el('button',{class:'b',onclick:()=>{
+    zona.innerHTML='';
+    let j; try{ j=normalizarLote(ta.value); }
+    catch(e){ zona.append(el('div',{class:'bloqueo',style:'margin:0'},'⚠',el('div',{},e.message))); bAplicar.disabled=true; return; }
+    const plan=planLote(j);
+    const crea=plan.filter(p=>p.accion==='crea').length, act=plan.filter(p=>p.accion==='actualiza').length;
+    const avisos=plan.filter(p=>p.aviso);
+    zona.append(el('div',{style:'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:var(--s2)'},
+      pill('v',crea+' se crean'),pill('a',act+' se actualizan'),
+      avisos.length?pill('m',avisos.length+' con aviso'):null,
+      j.descripcion?el('span',{class:'mi'},j.descripcion):null));
+    const t=el('table',{class:'cots'},el('thead',{},el('tr',{},el('th',{},'#'),el('th',{},'Qué'),
+      el('th',{},'Acción'),el('th',{},'Detalle'),el('th',{},'Aviso'))));
+    const tb=el('tbody');
+    plan.forEach(p=>tb.append(el('tr',{style:'cursor:default'},
+      el('td',{class:'mo'},String(p.i+1)),el('td',{},p.op),
+      el('td',{},pill(p.accion==='crea'?'v':p.accion==='actualiza'?'a':'g',p.accion)),
+      el('td',{},el('span',{class:'corta',style:'max-width:300px'},p.detalle)),
+      el('td',{},p.aviso?el('span',{class:'tx2',style:'color:var(--ojo)'},p.aviso):''))));
+    t.append(tb);
+    zona.append(el('div',{style:'max-height:34vh;overflow:auto;border:1px solid var(--linea);border-radius:var(--r)'},t));
+    bAplicar.disabled=false; bAplicar.dataset.listo='1';
+  }},'Ver qué haría');
+  const bAplicar=el('button',{class:'b pri',disabled:'true',onclick:()=>{
+    let j; try{ j=normalizarLote(ta.value); }catch(e){ toast(e.message); return; }
+    const r=ejecutarLote2(j);
+    cerrar();
+    toast(r.creados+' creados · '+r.actualizados+' actualizados'+(r.omitidos?' · '+r.omitidos+' omitidos':''),['Deshacer',undo]);
+  }},'Aplicar');
+  const bPegar=el('button',{class:'b',onclick:async()=>{
+    try{ ta.value=await navigator.clipboard.readText(); bVer.click(); }
+    catch(e){ toast('El navegador no me deja leer el portapapeles. Pega con Ctrl+V.'); ta.focus(); }
+  }},'Pegar del portapapeles');
+  pie.append(bPegar,bCerrar,bVer,bAplicar);
+  mo.append(pie);
+  ta.addEventListener('input',()=>{bAplicar.disabled=true;});
+  document.body.append(sc,mo); ta.focus();
+}
+function ejecutarLote2(j){
+  snap('importar en bloque');
+  const r=ejecutarLote(j);
+  save(); render();
+  return r;
+}
+
+/* superficie para un asistente: una sola llamada, sin clics */
+window.crm={
+  estado:()=>JSON.parse(JSON.stringify(S)),
+  resumen:()=>({cuentas:S.cuentas.length,proyectos:S.proyectos.length,cotizaciones:S.cotizaciones.length,
+    personas:S.contactos.length,tareas:S.tareas.filter(t=>!t.hecha).length,correosPendientes:(S.correos||[]).length}),
+  correos:()=>(S.correos||[]).map(m=>{const p=propuesta(m);
+    return {id:m.id,dir:m.dir,fecha:m.fecha,de:m.de,para:m.para,asunto:m.asunto,resumen:m.resumen,
+      adjuntos:m.adjuntos,cuenta:p.cuenta?p.cuenta.nombre:null,folios:p.folios,foliosNuevos:p.nuevos};}),
+  plan:txt=>planLote(normalizarLote(typeof txt==='string'?txt:JSON.stringify(txt))),
+  aplicar:txt=>ejecutarLote2(normalizarLote(typeof txt==='string'?txt:JSON.stringify(txt))),
+  procesarCorreos:()=>{const r=procesarAuto();save();render();return r;},
+  deshacer:()=>{undo();return 'ok';}
+};
+
 /* ============ PALETA DE COMANDOS ============
    La superficie completa del sistema vive acá: toda acción es alcanzable
    escribiendo. La barra visible se queda con cinco cosas. */
@@ -3706,6 +3918,7 @@ function cmdk(){
       {k:'filtro',n:'Solo prioridad A',s:'',go:()=>{UI.fA={prio:'A - Alta',canal:'',seg:'',txt:'',arch:false};UI.vista='tabla';irA({v:'cartera'});}},
       {k:'filtro',n:'Nunca contactadas',s:'',go:()=>{UI.fA={prio:'',canal:'NUNCA CONTACTADO',seg:'',txt:'',arch:false};UI.vista='tabla';irA({v:'cartera'});}},
       {k:'datos',n:'Buscar barridos de correo nuevos',s:'lee Cartera BB/correos',go:()=>leerBarridos().then(()=>render())},
+      {k:'datos',n:'Aplicar cambios en bloque',s:'pegar un JSON de operaciones',go:vistaLote},
       {k:'datos',n:'Descargar respaldo en Excel',s:'',go:descargarRespaldo},
       {k:'datos',n:'Guardar ahora en la carpeta',s:'',go:()=>guardarEnCarpeta().then(()=>toast('Guardado'))},
       {k:'datos',n:'Deshacer el último cambio',s:UNDO.length?UNDO[UNDO.length-1].d:'nada que deshacer',go:undo},
