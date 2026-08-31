@@ -3367,6 +3367,7 @@ function correoDe(x){
 function correosDe(x){
   if(!x)return [];
   if(Array.isArray(x))return x.map(correoDe).filter(Boolean);
+  if(typeof x==='string')return (x.match(/[\w.\-+]+@[\w.\-]+/g)||[]).map(s=>s.toLowerCase());
   const u=correoDe(x); return u?[u]:[];
 }
 const INTERNOS=['acma.cl','acmanet.cl','inchalam.cl'];
@@ -3386,35 +3387,56 @@ function cuentaPorCorreo(dirs){
   return null;
 }
 
+/* ingesta pura: recibe el JSON ya parseado, venga de la carpeta o de un archivo suelto */
+function ingerirBarrido(j){
+  S.correos=S.correos||[]; S.vistos=S.vistos||[];
+  const lista=x=>Array.isArray(x)?x:(x&&Array.isArray(x.body)?x.body:(x&&Array.isArray(x.value)?x.value:[]));
+  const respaldoFecha=String(j.generado||'').slice(0,10);
+  const yaTengo=new Set([...S.correos.map(x=>x.id),...S.vistos]);
+  let nuevos=0;
+  const meter=(arr,dir)=>{ lista(arr).forEach(m=>{
+    const id=String(m.id||m.internetMessageId||((m.asunto||m.subject||'')+(m.fecha||'')));
+    if(!id||yaTengo.has(id))return; yaTengo.add(id);
+    if(!(m.asunto||m.subject)&&!(m.de||m.from))return;
+    S.correos.push({id,dir,
+      de:correoDe(m.de||m.from),
+      para:correosDe(m.para||m.toRecipients),
+      asunto:String(m.asunto||m.subject||''),
+      fecha:String(m.fecha||m.receivedDateTime||m.sentDateTime||m.dateTimeReceived||respaldoFecha||'').slice(0,10),
+      resumen:String(m.resumen||m.bodyPreview||'').slice(0,600),
+      adjuntos:!!(m.adjuntos||m.hasAttachments)});
+    nuevos++; }); };
+  meter(j.recibidos,'in'); meter(j.enviados,'out');
+  S.correos.sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||''));
+  return nuevos;
+}
+/* cargar uno o varios barridos desde archivos que el usuario elige o arrastra */
+async function cargarArchivosBarrido(files){
+  let n=0, malos=0;
+  for(const f of files){
+    if(!/\.json$/i.test(f.name)){malos++;continue;}
+    try{ n+=ingerirBarrido(JSON.parse(await f.text())); }catch(e){ malos++; }
+  }
+  if(n){ snap('cargar barrido'); save(); }
+  render();
+  toast(n?(n+' correo(s) nuevo(s) cargado(s)'):(malos?'Ninguno de esos archivos era un barrido válido':'Sin correos nuevos: ya estaban todos'));
+  return n;
+}
 async function leerBarridos(){
   if(!DIR){ toast('No hay carpeta conectada'); return 0; }
-  const h=await subcarpeta(D_MAIL,false);
-  if(!h){ toast('Todavía no existe la carpeta correos'); return 0; }
-  S.correos=S.correos||[]; S.vistos=S.vistos||[];
-  const yaTengo=new Set([...S.correos.map(x=>x.id),...S.vistos]);
-  let nuevos=0, archivos=0;
+  let h=null;
+  try{ h=await DIR.getDirectoryHandle(D_MAIL,{create:false}); }
+  catch(e){ toast('No encuentro la carpeta «correos» dentro de '+DIR.name+'. Usa «Cargar un archivo» y arrastra el barrido.'); return 0; }
+  let nuevos=0, archivos=0, fallos=0;
   try{
     for await(const [nom,ent] of h.entries()){
       if(ent.kind!=='file'||!/\.json$/i.test(nom))continue;
       archivos++;
-      let j; try{ j=JSON.parse(await (await ent.getFile()).text()); }catch(e){ continue; }
-      const meter=(arr,dir)=>{ (arr||[]).forEach(m=>{
-        const id=String(m.id||m.internetMessageId||(m.asunto+m.fecha));
-        if(!id||yaTengo.has(id))return; yaTengo.add(id);
-        S.correos.push({id,dir,
-          de:correoDe(m.de||m.from),
-          para:correosDe(m.para||m.toRecipients),
-          asunto:String(m.asunto||m.subject||''),
-          fecha:String(m.fecha||m.receivedDateTime||m.sentDateTime||'').slice(0,10),
-          resumen:String(m.resumen||m.bodyPreview||'').slice(0,600),
-          adjuntos:!!(m.adjuntos||m.hasAttachments)});
-        nuevos++; }); };
-      meter(j.recibidos,'in'); meter(j.enviados,'out');
+      try{ nuevos+=ingerirBarrido(JSON.parse(await (await ent.getFile()).text())); }catch(e){ fallos++; }
     }
-  }catch(e){ toast('No pude leer la carpeta correos'); return 0; }
-  S.correos.sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||''));
-  save();
-  toast(archivos+' barrido(s) leído(s) · '+nuevos+' correo(s) nuevo(s)');
+  }catch(e){ toast('El navegador no me dejó leer la carpeta. Usa «Cargar un archivo».'); return 0; }
+  if(nuevos){ snap('leer barridos'); save(); }
+  toast(archivos?(archivos+' barrido(s) · '+nuevos+' correo(s) nuevo(s)'+(fallos?' · '+fallos+' ilegible(s)':'')):'La carpeta correos está vacía');
   return nuevos;
 }
 
@@ -3445,9 +3467,21 @@ function descartarCorreo(m){
   S.correos=S.correos.filter(x=>x.id!==m.id);
 }
 
+function botonCargarArchivo(destacado){
+  const inp=el('input',{type:'file',accept:'.json,application/json',multiple:'true',style:'display:none',
+    onchange:e=>{ cargarArchivosBarrido([...e.target.files]); }});
+  return el('span',{},el('button',{class:'b'+(destacado?'':' sutil'),
+    title:'Arrastra aquí el barrido_….json o elígelo desde el Explorador',
+    onclick:()=>inp.click()},'Cargar un archivo'),inp);
+}
 VIEWS.bandeja=function(v){
   const w=el('div',{class:'ancho rej'});
   S.correos=S.correos||[]; S.vistos=S.vistos||[];
+  ['dragenter','dragover'].forEach(ev=>w.addEventListener(ev,e=>{e.preventDefault();
+    w.style.outline='2px dashed var(--acc)';w.style.outlineOffset='6px';}));
+  ['dragleave','drop'].forEach(ev=>w.addEventListener(ev,e=>{e.preventDefault();w.style.outline='';}));
+  w.addEventListener('drop',e=>{e.preventDefault();w.style.outline='';
+    cargarArchivosBarrido([...(e.dataTransfer.files||[])]);});
   const todos=S.correos.map(m=>({m,p:propuesta(m)}));
   const conCuenta=todos.filter(x=>x.p.cuenta);
   const sinCuenta=todos.filter(x=>!x.p.cuenta);
@@ -3467,6 +3501,7 @@ VIEWS.bandeja=function(v){
     el('span',{class:'mi'},DIR?('lee Cartera BB/correos de '+DIR.name):'sin carpeta conectada'),
     el('span',{class:'sp'}),
     el('button',{class:'b',onclick:()=>leerBarridos().then(()=>render())},'Buscar barridos nuevos'),
+    botonCargarArchivo(),
     conCuenta.length?el('button',{class:'b pri',onclick:async()=>{
       if(!await confirmar('Aplicar '+conCuenta.length+' correos reconocidos: actualiza fechas de contacto, escribe la bitácora y cierra las tareas de espera que correspondan.','Aplicar todo'))return;
       mut('aplicar bandeja',()=>conCuenta.forEach(x=>aplicarCorreo(x.m,x.p)));
@@ -3479,8 +3514,9 @@ VIEWS.bandeja=function(v){
   if(!todos.length){
     w.append(el('div',{class:'c'},vacio(ICO.cotizar,
       DIR?'No hay correos por revisar':'Conecta la carpeta primero',
-      DIR?'Cuando el flujo de Power Automate escriba un barrido en Cartera BB/correos, apreta «Buscar barridos nuevos» y los correos aparecen aquí para que los confirmes uno a uno o en bloque.':'',
-      el('button',{class:'b pri',onclick:()=>leerBarridos().then(()=>render())},'Buscar barridos nuevos'))));
+      DIR?'Apreta «Buscar barridos nuevos» para leer Cartera BB/correos. Si el navegador no deja, arrastra el archivo barrido_….json directo sobre esta pantalla o usa «Cargar un archivo».':'',
+      el('button',{class:'b pri',onclick:()=>leerBarridos().then(()=>render())},'Buscar barridos nuevos'),
+      botonCargarArchivo(true))));
     v.append(w); return;
   }
 
