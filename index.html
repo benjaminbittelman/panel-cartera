@@ -4370,7 +4370,8 @@ function ingerirBarrido(j){
       asunto:String(m.asunto||m.subject||''),
       fecha:String(m.fecha||m.receivedDateTime||m.sentDateTime||m.dateTimeReceived||respaldoFecha||'').slice(0,10),
       resumen:String(m.resumen||m.bodyPreview||'').slice(0,600),
-      adjuntos:!!(m.adjuntos||m.hasAttachments)});
+      adjuntos:!!(m.adjuntos||m.hasAttachments),
+      nombresAdj:String(m.nombresAdj||m.adjuntosNombres||'').slice(0,400)});
     nuevos++; }); };
   meter(j.recibidos,'in'); meter(j.enviados,'out');
   S.correos.sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||''));
@@ -4452,7 +4453,8 @@ function resumenAuto(r){
 /* qué propone el panel para cada correo */
 function propuesta(m){
   const c=cuentaPorCorreo(m.dir==='out'?m.para:[m.de]);
-  const folios=foliosEn(m.asunto+' '+m.resumen);
+  /* el nombre de los adjuntos es la mejor señal: BB2026-024_GGL_DOREMI.pdf */
+  const folios=foliosEn([m.asunto,m.resumen,m.nombresAdj||''].join(' '));
   const cots=folios.map(f=>S.cotizaciones.find(q=>q.folio===f)).filter(Boolean);
   const nuevos=folios.filter(f=>!S.cotizaciones.some(q=>q.folio===f));
   const esperando=c?abiertas(c.nombre).filter(t=>t.tipo==='esperando'&&
@@ -4464,7 +4466,9 @@ function aplicarCorreo(m,p){
   if(m.dir==='out'){ if((c.ultMio||'')<m.fecha){c.ultMio=m.fecha;c.hablo='Benjamín';} }
   else { if((c.ultSuyo||'')<m.fecha){c.ultSuyo=m.fecha;c.hablo='cliente';}
     if(['NUNCA CONTACTADO','SIN DATOS DE CONTACTO','CONTACTADO SIN RESPUESTA'].includes(c.canal))c.canal='EN NEGOCIACIÓN'; }
-  logB(c.nombre,'correo',(m.dir==='out'?'Enviado: ':'Recibido de '+m.de+': ')+m.asunto,m.fecha);
+  const fols=foliosEn(m.asunto+' '+m.resumen);
+  logB(c.nombre,'correo',(m.dir==='out'?'Enviado: ':'Recibido de '+m.de+': ')+m.asunto+
+    (fols.length>1?' · menciona '+fols.join(', '):''),m.fecha);
   if(m.dir==='in')p.esperando.forEach(t=>{ t.hecha=true; t.hechaTs=m.fecha;
     logB(c.nombre,'tarea','Cerrada por respuesta del cliente: '+t.texto,m.fecha); });
   S.vistos=S.vistos||[]; S.vistos.push(m.id);
@@ -4570,7 +4574,9 @@ function filaCorreo(m,p){
   if(p.cuenta)mt.append(el('button',{class:'lk',style:'font-size:11.5px',onclick:()=>abrir(p.cuenta.nombre)},p.cuenta.nombre));
   p.cots.forEach(q=>ap(mt,el('button',{class:'lk mo',style:'font-size:11px',
     onclick:()=>{UI.openCot=q.qid;if(q.proyecto)irA({v:'proyecto',id:q.proyecto});else abrir(q.cuenta,'proyectos');}},folioRev(q))));
-  p.nuevos.forEach(f=>ap(mt,pill('r',f+' no registrada')));
+  p.nuevos.forEach(f=>ap(mt,el('button',{class:'e r',style:'cursor:pointer',
+    title:'Registrar '+f+' desde este correo',
+    onclick:ev=>{ev.stopPropagation();crearDesdeCorreo(m,p,f);}},f+' no registrada')));
   bd.append(mt);
   if(m.resumen)bd.append(el('div',{class:'tx2',style:'margin-top:4px;max-width:760px'},
     m.resumen.slice(0,220)+(m.resumen.length>220?'…':'')));
@@ -4583,8 +4589,11 @@ function filaCorreo(m,p){
   }
   w.append(bd);
   const ac=el('div',{class:'ac'});
-  if(p.nuevos.length)ap(ac,el('button',{class:'b xs pri',onclick:()=>crearDesdeCorreo(m,p)},
+  if(p.nuevos.length===1)ap(ac,el('button',{class:'b xs pri',onclick:()=>crearDesdeCorreo(m,p,p.nuevos[0])},
     'Registrar '+p.nuevos[0]));
+  if(p.nuevos.length>1)ap(ac,el('button',{class:'b xs pri',
+    title:'Un correo puede llevar varias ofertas: las registra una tras otra',
+    onclick:()=>registrarVarias(m,p)},'Registrar las '+p.nuevos.length));
   ap(ac,el('button',{class:'b xs',title:'Crear una tarea a partir de este correo, con o sin cuenta',
     onclick:()=>agendarDesdeCorreo(m,p)},'Agendar'));
   if(p.cuenta)ap(ac,el('button',{class:'b xs'+(p.nuevos.length?'':' pri'),
@@ -4618,6 +4627,22 @@ async function agendarDesdeCorreo(m,p){
   toast('Agendado'+(r.cuenta===SIN_CUENTA?' como tarea interna':' en '+r.cuenta));
 }
 
+/* un correo con tres adjuntos son tres ofertas: se registran en fila,
+   arrastrando la cuenta y la obra de la primera para no repetirlo todo */
+async function registrarVarias(m,p){
+  const faltan=[...p.nuevos];
+  if(!await confirmar('Este correo menciona '+faltan.length+' cotizaciones que no están en el CRM: '+
+    faltan.join(', ')+'. Te voy a pedir los datos de cada una.','Registrarlas'))return;
+  for(const f of faltan){
+    const pp=propuesta(m);
+    if(!pp.nuevos.includes(f))continue;
+    await crearDesdeCorreo(m,pp,f);
+  }
+  const fin=propuesta(m);
+  if(!fin.nuevos.length&&fin.cuenta)mut('aplicar correo',()=>aplicarCorreo(m,fin));
+  toast('Listo. Cada una quedó con su tarea de cargar el detalle.');
+}
+
 async function asignarCuenta(m){
   const dir=m.dir==='out'?(m.para[0]||''):m.de;
   const r=await ask('¿De qué cuenta es este correo?',[
@@ -4633,8 +4658,8 @@ async function asignarCuenta(m){
   });
   toast('Aplicado a '+r.cuenta);
 }
-async function crearDesdeCorreo(m,p){
-  const folio=p.nuevos[0];
+async function crearDesdeCorreo(m,p,folioPedido){
+  const folio=folioPedido||p.nuevos[0];
   const cn=p.cuenta?p.cuenta.nombre:activas()[0]?.nombre;
   const proys=proyectosDe(cn);
   const r=await ask('Registrar '+folio+' desde el correo',[
@@ -4658,7 +4683,7 @@ async function crearDesdeCorreo(m,p){
       ejecucion:'',hitos:{oc:'',ingreso:'',programa:'',despacho:'',entrega:'',factura:''},
       ingreso:{calendario:'',precioKilo:null,direccion:'',contactoObra:'',segmento:'',camiones:''},incidencias:[]});
     nuevaTarea(r.cuenta,'Cargar el detalle de '+folio+' (líneas, kilos y neto)',iso(HOY),'mio',folio);
-    aplicarCorreo(m,propuesta(m));
+    if(!propuesta(m).nuevos.length)aplicarCorreo(m,propuesta(m));
   });
   toast(folio+' registrada, con tarea para cargarle el detalle');
 }
