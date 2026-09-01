@@ -746,6 +746,7 @@ function migrar(st){
     if(!q.hitos)q.hitos={oc:'',ingreso:'',programa:'',despacho:'',entrega:'',factura:''};
     if(!q.ingreso)q.ingreso={calendario:'',precioKilo:null,direccion:'',contactoObra:'',segmento:'',camiones:''};
     if(!q.incidencias)q.incidencias=[];
+    if(!q.revalidaciones)q.revalidaciones=[];
     if(q.proyecto&&st.proyectos.some(p=>p.pid===q.proyecto))return;
     const nom=(q.obra||'Obra sin definir').trim();
     let p=st.proyectos.find(x=>x.cuenta===q.cuenta&&norm(x.nombre)===norm(nom));
@@ -1082,6 +1083,44 @@ async function duplicarCotizacion(q){
   toast('Creada '+r.folio.trim()+' con las mismas líneas');
 }
 
+
+/* ============================================================
+   REVALIDAR
+   Extender la vigencia sin tocar precio ni alcance. No es una
+   revisión: la oferta es la misma, solo se corre el plazo para
+   aceptarla. Queda registrado quién lo pidió y hasta cuándo.
+   ============================================================ */
+async function revalidar(q){
+  const d=dias(q.validez);
+  const ctx=d===null?'Esta oferta no tiene vigencia cargada. ':
+    (d<0?'Venció hace '+Math.abs(d)+' días. ':'Vence en '+d+' días. ');
+  const r=await ask('Revalidar '+folioRev(q),[
+    {k:'val',label:ctx+'Nueva fecha de validez',type:'date',
+     value:iso(new Date(HOY.getTime()+15*864e5))},
+    {k:'motivo',label:'Por qué se extiende',type:'select',
+     options:['El cliente sigue evaluando','Se atrasó la licitación','Esperando la OC',
+              'Se atrasó el inicio de obra','Petición del cliente','Otro'],
+     value:'El cliente sigue evaluando'},
+    {k:'precio',label:'¿Los precios se mantienen?',type:'select',
+     options:['Sí, mismo precio','No, hay que recotizar'],value:'Sí, mismo precio'},
+    {k:'nota',label:'Detalle (opcional)',type:'textarea'}],'Revalidar');
+  if(!r)return;
+  if(r.precio.startsWith('No')){ toast('Si el precio cambia, usa Recotizar en vez de revalidar'); return recotizar(q); }
+  mut('revalidar',()=>{
+    q.revalidaciones=q.revalidaciones||[];
+    q.revalidaciones.unshift({id:uid(),ts:iso(HOY),desde:q.validez,hasta:r.val,motivo:r.motivo,nota:r.nota||''});
+    q.validez=r.val;
+    if(q.cond)q.cond.validezTexto='Órdenes de compra recibidas hasta el '+
+      (r.val||'').split('-').reverse().join('-')+'; precios revalidados el '+iso(HOY).split('-').reverse().join('-');
+    if(['Perdida','Reemplazada'].includes(q.estado))q.estado='Enviada';
+    logB(q.cuenta,'cotizacion','['+q.folio+'] revalidada hasta el '+fdate(r.val)+
+      ' sin cambio de precio. Motivo: '+r.motivo+(r.nota?'. '+r.nota:''));
+    nuevaTarea(q.cuenta,'Confirmar a '+(q.contacto||'el cliente')+' la revalidación de '+folioRev(q)+
+      ' hasta el '+fdate(r.val),iso(HOY),'mio',q.folio);
+  });
+  toast(folioRev(q)+' vigente hasta el '+fdate(r.val)+'. Queda la tarea de avisarle al cliente.');
+}
+
 /* ---- crear / borrar ---- */
 async function crearCuenta(){
   const r=await ask('Nueva cuenta',[
@@ -1362,6 +1401,9 @@ function xlsxBlob(){
   hoja('LINEAS',[['Folio',l=>l.folio],['Cuenta',l=>l.cuenta],['Familia',l=>l.familia],['Descripción',l=>l.producto],
     ['kg',l=>l.kg||''],['$/kg',l=>l.precioKg||''],['Monto fijo',l=>l.monto||''],
     ['Total',l=>Math.round((Number(l.kg)||0)*(Number(l.precioKg)||0)+(Number(l.monto)||0))]],lin);
+  const rvl=[]; S.cotizaciones.forEach(q=>(q.revalidaciones||[]).forEach(x=>rvl.push({...x,folio:q.folio,cuenta:q.cuenta})));
+  hoja('REVALIDACIONES',[['Folio',x=>x.folio],['Cuenta',x=>x.cuenta],['Fecha',x=>x.ts],
+    ['Vencía',x=>x.desde],['Nueva validez',x=>x.hasta],['Motivo',x=>x.motivo],['Detalle',x=>x.nota]],rvl);
   const vers=[]; S.cotizaciones.forEach(q=>(q.versiones||[]).forEach(v=>vers.push({...v,folio:q.folio,cuenta:q.cuenta})));
   hoja('VERSIONES',[['Folio',v=>v.folio],['Rev',v=>v.rev],['Cuenta',v=>v.cuenta],['Guardada el',v=>v.ts],
     ['Neto',v=>v.neto],['kg',v=>v.kg||''],['Validez',v=>v.validez],['Etapa',v=>v.estado],
@@ -2961,10 +3003,18 @@ VIEWS.cotizar=function(v){
 };
 window.addEventListener('message',ev=>{
   const m=ev.data; if(!m||typeof m!=='object'||!String(m.tipo||'').startsWith('acma-cot'))return;
-  if(m.tipo==='acma-cot-listo'){ const f=$('#cotFrame'); if(!f)return;
-    f.contentWindow.postMessage({tipo:'acma-cot-contexto',campos:contextoCotizador()},'*'); return; }
+  if(m.tipo==='acma-cot-listo'){ enviarContextoCotizador(); return; }
+  if(m.tipo==='acma-cot-hoja'){ mostrarHojaCotizador(m.html); return; }
   if(m.tipo==='acma-cot-guardar')recibirCotizacion(m);
 });
+/* lee el estado que dejó el cotizador para esa cotización, si existe */
+async function snapshotDe(q){
+  if(!DIR||!q)return null;
+  try{ const h=await subcarpeta(D_COT,false); if(!h)return null;
+    const fh=await h.getFileHandle(claveDoc(q)+'.cotizador.json');
+    return JSON.parse(await (await fh.getFile()).text());
+  }catch(e){ return null; }
+}
 function contextoCotizador(){
   if(!COT_CTX)return {};
   const c=cuenta(COT_CTX.cuenta),p=COT_CTX.proyecto?proyecto(COT_CTX.proyecto):null;
@@ -2972,7 +3022,24 @@ function contextoCotizador(){
   const pr=contactosDe(COT_CTX.cuenta).find(x=>x.rol==='Decide')||contactosDe(COT_CTX.cuenta)[0];
   return {cliente:c?.nombre||'',contacto:(q?.contacto)||pr?.nombre||c?.contacto||'',
     obra:q?.obra||p?.nombre||'',comuna:p?.comuna||'',folio:q?q.folio:siguienteFolio(),
-    rev:q?String(q.rev||0):'0',e_correo:pr?.email||c?.email||'',fvalida:q?.validez||''};
+    rev:q?String(q.rev||0):'0',e_correo:q?.emailContacto||pr?.email||c?.email||'',
+    fvalida:q?.validez||'',femision:q?.fecha||'',
+    c_plazo:q?.cond?.plazoEntrega||'',c_pago:q?.cond?.condPago||'',c_lugar:q?.cond?.lugarEntrega||'',
+    c_reajuste:q?.cond?.reajuste||'',c_facturacion:q?.cond?.facturacion||'',c_anticipo:q?.cond?.anticipo||'',
+    c_despacho:q?.cond?.despachoMin||'',glosa:q?.cond?.notaTecnica||''};
+}
+/* manda el contexto y, si existe, el estado completo para poder modificar de verdad */
+async function enviarContextoCotizador(){
+  const f=$('#cotFrame'); if(!f||!f.contentWindow)return;
+  const q=COT_CTX?.qid?S.cotizaciones.find(x=>x.qid===COT_CTX.qid):null;
+  const snap=q?await snapshotDe(q):null;
+  f.contentWindow.postMessage({tipo:'acma-cot-contexto',campos:contextoCotizador(),
+    snapshot:snap,sobrescribir:!!q},'*');
+  if(q){
+    if(snap)toast(folioRev(q)+' cargada completa en el cotizador. Lo que edites y guardes vuelve al CRM.');
+    else toast(folioRev(q)+': solo se cargó la cabecera. Esta cotización no se creó en el cotizador, así que no existe su cubicación.',
+      ['Entendido',()=>{}]);
+  }
 }
 function recibirCotizacion(m){
   const r=m.resumen||{};
@@ -3193,6 +3260,65 @@ function pgProyecto(v,p){
   v.append(w);
 }
 
+/* ---------- la hoja tal como la imprime el cotizador ---------- */
+let HOJA_PEND=null;
+function panelHoja(q){
+  const cont=el('div',{style:'padding:var(--s4)'});
+  cont.append(el('div',{style:'display:flex;gap:8px;align-items:center;margin-bottom:var(--s3);flex-wrap:wrap'},
+    el('span',{class:'mi'},'Esta es la maqueta del cotizador, la misma que sale impresa al cliente.'),
+    el('span',{style:'flex:1'}),
+    el('button',{class:'b xs pri',onclick:()=>pedirHoja(q)},'Generar la hoja'),
+    el('button',{class:'b xs',onclick:()=>{UI.docTab='doc';render();}},'Ver la ficha del CRM')));
+  const caja=el('div',{id:'cajaHoja',
+    style:'border:1px solid var(--linea);border-radius:var(--r);background:#fff;min-height:320px'});
+  if(HOJA_PEND&&HOJA_PEND.qid===q.qid){
+    const marco=el('iframe',{style:'width:100%;height:min(76vh,1000px);border:0;display:block;background:#fff'});
+    caja.append(marco);
+    setTimeout(()=>{ try{ marco.contentDocument.open(); marco.contentDocument.write(HOJA_PEND.html);
+      marco.contentDocument.close(); }catch(e){} },30);
+    cont.append(caja,el('div',{style:'margin-top:var(--s3);display:flex;gap:7px'},
+      el('button',{class:'b',onclick:()=>{const v=window.open('','_blank');
+        if(v){v.document.open();v.document.write(HOJA_PEND.html);v.document.close();}}},'Abrir aparte'),
+      el('button',{class:'b',onclick:()=>{const b=new Blob([HOJA_PEND.html],{type:'text/html;charset=utf-8'});
+        const a=el('a',{href:URL.createObjectURL(b),download:claveDoc(q)+'_hoja.html'});
+        document.body.append(a);a.click();a.remove();}},'Descargar')));
+    return cont;
+  }
+  caja.append(vacio(ICO.cotizar,'La hoja se genera desde el cotizador',
+    'El cotizador arma el documento con su propia maqueta, que es la que ha ido al cliente. Apreta «Generar la hoja»: se abre el cotizador con esta cotización cargada y devuelve el documento aquí. '+
+    'Requiere que la cotización se haya creado en el cotizador; si vino del Excel o la cargaste a mano, no existe su cubicación.',
+    el('button',{class:'b pri',onclick:()=>pedirHoja(q)},'Generar la hoja')));
+  cont.append(caja);
+  return cont;
+}
+async function pedirHoja(q){
+  const snap=await snapshotDe(q);
+  if(!snap){ await ask('No hay estado del cotizador para '+folioRev(q),
+    [{k:'x',label:'Qué pasa',type:'textarea',
+      value:'Esta cotización no se generó desde el cotizador embebido, así que no existe el archivo '+claveDoc(q)+'.cotizador.json con su cubicación, precios y plan de carga.\n\nPara tenerla: abre la cotización en el cotizador, carga la cubicación y genera el PDF desde ahí. A partir de ese momento la hoja se puede reproducir siempre.'}],'Entendido');
+    return; }
+  toast('Generando la hoja en el cotizador…');
+  HOJA_PEND={qid:q.qid,html:null,pidiendo:true};
+  abrirCotizadorSilencioso(q,snap);
+}
+function abrirCotizadorSilencioso(q,snap){
+  document.querySelectorAll('#marcoHoja').forEach(n=>n.remove());
+  const f=el('iframe',{id:'marcoHoja',src:'cotizador.html',
+    style:'position:fixed;left:-9999px;top:0;width:1200px;height:900px;border:0'});
+  f.addEventListener('load',()=>{ setTimeout(()=>{ try{
+    f.contentWindow.postMessage({tipo:'acma-cot-contexto',campos:contextoCotizador(),snapshot:snap,sobrescribir:true},'*');
+    setTimeout(()=>f.contentWindow.postMessage({tipo:'acma-cot-pedir-hoja',qid:q.qid},'*'),700);
+  }catch(e){} },400); });
+  document.body.append(f);
+}
+function mostrarHojaCotizador(html){
+  document.querySelectorAll('#marcoHoja').forEach(n=>n.remove());
+  if(!HOJA_PEND){ return; }
+  HOJA_PEND.html=html; HOJA_PEND.pidiendo=false;
+  UI.docTab='hoja'; render();
+  toast('Hoja generada con la maqueta del cotizador');
+}
+
 /* ---------- el PDF real, el que salió al cliente ---------- */
 function panelPDF(q){
   const k=claveDoc(q), tiene=estadoDoc(q).pdf;
@@ -3250,7 +3376,7 @@ function docCotizacion(q){
   const barra=el('div',{class:'barra-doc'});
   const a=estadoDoc(q);
   barra.append(el('div',{class:'grupo'},
-    ...[['doc','Documento'],['pdf','PDF'],['proceso','Proceso'],['revs','Revisiones']].map(([k,l])=>
+    ...[['doc','Ficha'],['hoja','Hoja'],['pdf','PDF'],['proceso','Proceso'],['revs','Revisiones']].map(([k,l])=>
       el('button',{'aria-current':(UI.docTab||'doc')===k?'true':'false',
         onclick:()=>{UI.docTab=k;render();}},l,
         k==='revs'&&(q.versiones||[]).length?el('span',{style:'font-family:var(--m);font-size:10px;opacity:.6;margin-left:5px'},String(q.versiones.length)):null,
@@ -3263,7 +3389,11 @@ function docCotizacion(q){
         el('i',{style:'width:7px;height:7px;border-radius:4px;display:inline-block;background:'+(a.json&&a.html?'var(--ok)':'var(--linea2)')}),
         el('i',{style:'width:7px;height:7px;border-radius:4px;display:inline-block;background:'+(a.pdf?'var(--ok)':'var(--mal)')}),
         el('span',{class:'mi',style:'margin-left:3px'},a.pdf?'archivada':'falta el PDF'))),
-    el('button',{class:'b xs pri',onclick:()=>recotizar(q)},'Recotizar'),
+    (()=>{const dd=dias(q.validez);
+      return VIVA(q)?el('button',{class:'b xs'+(dd!==null&&dd<7?' pri':''),
+        title:'Extender la vigencia sin cambiar precio ni alcance',
+        onclick:()=>revalidar(q)},'Revalidar'):null;})(),
+    el('button',{class:'b xs'+(VIVA(q)&&dias(q.validez)!==null&&dias(q.validez)<0?'':' pri'),onclick:()=>recotizar(q)},'Recotizar'),
     el('button',{class:'b xs ico',title:'Más acciones',onclick:e=>menu(e.currentTarget,[
       {titulo:folioRev(q),items:[
         {txt:'Duplicar a otro folio',fn:()=>duplicarCotizacion(q)},
@@ -3279,6 +3409,7 @@ function docCotizacion(q){
 
   const tab=UI.docTab||'doc';
   if(tab==='pdf'){ w.append(panelPDF(q)); return w; }
+  if(tab==='hoja'){ w.append(panelHoja(q)); return w; }
   if(tab==='proceso'){
     w.append(via(q));
     if(q.estado==='Adjudicada')w.append(viaEjecucion(q),bloqueRequisitos(q));
