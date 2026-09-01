@@ -799,7 +799,7 @@ function migrar(st){
   st.version=4;
   st.tareas=st.tareas||[];
   st.proyectos=st.proyectos||[];
-  st.correos=st.correos||[]; st.vistos=st.vistos||[];
+  st.correos=st.correos||[]; st.vistos=st.vistos||[]; st.folios=st.folios||[];
   if(st.autoAplicar===undefined)st.autoAplicar=true;
   if(st.ultimoBarrido===undefined)st.ultimoBarrido='';
   if(st.autoDescartarInternos===undefined)st.autoDescartarInternos=false;
@@ -1054,9 +1054,11 @@ async function marcarPerdida(q){
   toast(q.folio+' cerrada como perdida');
 }
 function siguienteFolio(){
-  const ns=S.cotizaciones.map(q=>{const m=String(q.folio).match(/(\d+)\s*$/);return m?+m[1]:0;});
-  const max=Math.max(0,...ns); const base=S.cotizaciones[0]?String(S.cotizaciones[0].folio).replace(/\d+\s*$/,''):'BB2026-';
-  return base+String(max+1).padStart(3,'0');
+  try{ return siguienteFolioLibre(); }catch(e){
+    const ns=S.cotizaciones.map(q=>{const m=String(q.folio).match(/(\d+)\s*$/);return m?+m[1]:0;});
+    const max=Math.max(0,...ns);
+    const base=S.cotizaciones[0]?String(S.cotizaciones[0].folio).replace(/\d+\s*$/,''):'BB2026-';
+    return base+String(max+1).padStart(3,'0'); }
 }
 async function reemitir(q){
   const r=await ask('Reemitir '+q.folio,[
@@ -1331,7 +1333,7 @@ async function crearCuenta(){
   });
   toast('Cuenta creada');
 }
-async function crearCotizacion(cn,pid){
+async function crearCotizacion(cn,pid,folioSug){
   const p0=pid?proyecto(pid):null;
   const cn2=p0?p0.cuenta:(cn||activas()[0]?.nombre);
   const proys=proyectosDe(cn2);
@@ -1339,14 +1341,18 @@ async function crearCotizacion(cn,pid){
     {k:'cuenta',label:'Cuenta',type:'select',options:activas().map(c=>c.nombre),value:cn2},
     {k:'proyecto',label:'Proyecto',type:'select',options:['— crear proyecto nuevo —',...proys.map(p=>p.nombre)],
       value:p0?p0.nombre:(proys[0]?.nombre||'— crear proyecto nuevo —')},
-    {k:'folio',label:'Folio',value:siguienteFolio()},
+    {k:'folio',label:'Folio',value:folioSug||siguienteFolio()},
     {k:'alcance',label:'Alcance de esta oferta',ph:'ej. malla de losas torres A y B'},
     {k:'validez',label:'Válida hasta',type:'date',value:iso(new Date(HOY.getTime()+15*864e5))},
     {k:'estado',label:'Etapa',type:'select',options:ETAPAS,value:'Por enviar'}],'Crear');
   if(!r||!r.folio.trim())return;
+  if(S.cotizaciones.some(x=>x.folio===r.folio.trim())){
+    if(!await confirmar('El folio '+r.folio.trim()+' ya está usado por otra cotización. Si lo repites, el archivo documental de una va a pisar el de la otra.','Crearla igual'))return;
+  }
   let pr=S.proyectos.find(p=>p.cuenta===r.cuenta&&p.nombre===r.proyecto);
   if(!pr){ pr=await crearProyecto(r.cuenta); if(!pr)return; }
   mut('crear cotización',()=>{
+    S.folios=(S.folios||[]).filter(x=>x.n!==r.folio.trim());
     const c=cuenta(r.cuenta);
     const q={qid:uid(),folio:r.folio.trim(),rev:0,versiones:[],fecha:iso(HOY),cuenta:r.cuenta,proyecto:pr.pid,
       obra:r.alcance||pr.nombre,contacto:c?.contacto||'',email:c?.email||'',producto:'',neto:0,kg:null,
@@ -2297,6 +2303,150 @@ function tarjetaCerradas(){
 }
 
 /* ============================================================
+   REGISTRO DE FOLIOS
+   La serie es un recurso compartido: la usas desde el panel, desde el
+   cotizador suelto y a mano en un correo. Sin un registro único
+   terminas repitiendo números y saltándote otros, que es justo lo que
+   pasó con el BB2026-018 y con el 019 que el PDF llamó 023.
+   ============================================================ */
+const PREFIJO=()=>{
+  const f=(S.cotizaciones[0]||{}).folio||'BB2026-001';
+  const m=String(f).match(/^(.*?)(\d+)\s*$/);
+  return m?m[1]:'BB2026-';
+};
+const numFolio=f=>{const m=String(f||'').match(/(\d+)\s*$/);return m?+m[1]:null;};
+const armaFolio=n=>PREFIJO()+String(n).padStart(3,'0');
+
+function registroFolios(){
+  const usa={}, dup={};
+  S.cotizaciones.forEach(q=>{const n=numFolio(q.folio); if(n===null)return;
+    if(usa[n])dup[n]=(dup[n]||[usa[n]]).concat(q); else usa[n]=q;});
+  const res={}; (S.folios||[]).forEach(r=>{const n=numFolio(r.n); if(n!==null)res[n]=r;});
+  const nums=[...Object.keys(usa),...Object.keys(res)].map(Number);
+  const max=nums.length?Math.max(...nums):0;
+  const filas=[];
+  for(let n=1;n<=max+3;n++){
+    const q=usa[n], r=res[n];
+    filas.push({n,folio:armaFolio(n),q,res:r,dups:dup[n]||null,
+      estado:dup[n]?'duplicado':q?'usado':r?'reservado':'libre'});
+  }
+  return {filas,max,
+    huecos:filas.filter(f=>f.estado==='libre'&&f.n<max).length,
+    duplicados:filas.filter(f=>f.estado==='duplicado').length,
+    reservados:filas.filter(f=>f.estado==='reservado').length};
+}
+/* el siguiente libre de verdad: salta usados y reservados */
+function siguienteFolioLibre(){
+  const r=registroFolios();
+  const f=r.filas.find(x=>x.estado==='libre'&&x.n>r.max);
+  return f?f.folio:armaFolio(r.max+1);
+}
+async function reservarFolio(n){
+  const f=armaFolio(n);
+  const r=await ask('Reservar '+f,[
+    {k:'para',label:'¿Para qué o para quién?',ph:'ej. Quilin · Proyecto AMB'},
+    {k:'nota',label:'Nota',type:'textarea',ph:'dónde se va a emitir: cotizador suelto, a mano, otro KAM…'}],'Reservar');
+  if(!r)return;
+  mut('reservar folio',()=>{
+    S.folios=S.folios||[];
+    S.folios=S.folios.filter(x=>numFolio(x.n)!==n);
+    S.folios.push({n:f,ts:iso(HOY),para:r.para||'',nota:r.nota||''});
+  });
+  try{ navigator.clipboard.writeText(f); toast(f+' reservado y copiado al portapapeles'); }
+  catch(e){ toast(f+' reservado'); }
+}
+function liberarFolio(n){
+  mut('liberar folio',()=>{ S.folios=(S.folios||[]).filter(x=>numFolio(x.n)!==n); });
+}
+async function renumerar(q){
+  const r=registroFolios();
+  const libres=r.filas.filter(x=>x.estado==='libre').map(x=>x.folio).slice(0,12);
+  const rr=await ask('Renumerar '+folioRev(q),[
+    {k:'folio',label:'Folio nuevo',value:libres[0]||siguienteFolioLibre()},
+    {k:'libres',label:'Libres disponibles',type:'select',options:libres.length?libres:['(no hay huecos)'],value:libres[0]||''},
+    {k:'motivo',label:'Por qué se renumera',type:'textarea',value:'Corrección de folio duplicado.'}],'Renumerar');
+  if(!rr)return;
+  const nuevo=(rr.folio||'').trim()||rr.libres;
+  if(!nuevo||nuevo.startsWith('('))return;
+  if(S.cotizaciones.some(x=>x!==q&&x.folio===nuevo)){ toast('Ese folio ya está usado'); return; }
+  mut('renumerar',()=>{
+    const antes=q.folio; q.folio=nuevo;
+    S.tareas.forEach(t=>{ if(t.folio===antes)t.folio=nuevo; });
+    logB(q.cuenta,'cotizacion','['+antes+'] renumerada a '+nuevo+'. '+(rr.motivo||''));
+    S.folios=(S.folios||[]).filter(x=>numFolio(x.n)!==numFolio(nuevo));
+  });
+  toast('Ahora es '+nuevo+'. Ojo: los archivos guardados con el nombre anterior hay que renombrarlos.');
+}
+
+VIEWS.folios=function(v){
+  const w=el('div',{class:'ancho rej'});
+  const r=registroFolios();
+  const sig=siguienteFolioLibre();
+  w.append(el('div',{class:'cifras jer'},
+    cifra('Siguiente disponible',sig,'úsalo cuando cotices fuera del panel','hero'),
+    cifra('Emitidos',String(S.cotizaciones.length),'sobre una serie de '+r.max),
+    cifra('Duplicados',String(r.duplicados),r.duplicados?'el mismo número en dos ofertas':'sin choques',
+      r.duplicados?'ml':'ok'),
+    cifra('Huecos',String(r.huecos),r.huecos?'números saltados en la serie':'serie continua',r.huecos?'oj':'ok'),
+    cifra('Reservados',String(r.reservados),'apartados y aún sin emitir')));
+
+  if(r.duplicados)w.append(el('div',{class:'c'},el('div',{class:'bloqueo',style:'margin:var(--s4)'},'⚠',
+    el('div',{},'Hay ',el('strong',{},r.duplicados+' folio(s) duplicado(s)'),
+      '. Mientras estén repetidos, el archivo documental de una cotización pisa el de la otra, porque ambas guardan con la misma clave. Renumera una de las dos.'))));
+
+  const card=el('div',{class:'c'});
+  card.append(el('header',{},el('h3',{},'Serie de folios'),
+    el('span',{class:'mi'},'usados, reservados y libres'),el('span',{class:'sp'}),
+    el('button',{class:'b',onclick:()=>{try{navigator.clipboard.writeText(sig);toast(sig+' copiado');}catch(e){}}},'Copiar '+sig),
+    el('button',{class:'b pri',onclick:()=>reservarFolio(numFolio(sig))},'Reservar el siguiente')));
+  const host=el('div',{class:'tw'});
+  const t=el('table',{class:'tabla'},el('thead',{},el('tr',{},el('th',{class:'fijo',style:'width:118px'},'Folio'),
+    el('th',{class:'fijo',style:'width:96px'},'Estado'),el('th',{class:'fijo'},'Cuenta / obra'),
+    el('th',{class:'fijo'},'Etapa'),el('th',{class:'fijo',style:'text-align:right'},'Neto'),
+    el('th',{class:'fijo'},'Emitida'),el('th',{class:'fijo',style:'width:150px'},''))));
+  const tb=el('tbody');
+  r.filas.slice().reverse().forEach(f=>{
+    const q=f.q, p=q?proyecto(q.proyecto):null;
+    const ir=x=>{UI.openCot=x.qid; if(x.proyecto)irA({v:'proyecto',id:x.proyecto}); else abrir(x.cuenta,'proyectos');};
+    if(f.estado==='duplicado'){
+      f.dups.forEach((x,k)=>{
+        const px=proyecto(x.proyecto);
+        tb.append(el('tr',{style:'background:var(--mal-s)'},
+          k===0?el('td',{class:'mo',rowspan:String(f.dups.length),style:'font-weight:600;vertical-align:top;padding-top:9px'},
+            f.folio,el('div',{},pill('r','duplicado'))):null,
+          el('td',{},pill('r','choque')),
+          el('td',{},el('button',{class:'lk',onclick:()=>ir(x)},x.cuenta),
+            el('div',{class:'mi'},px?px.nombre:x.obra)),
+          el('td',{},pill(x.estado==='Adjudicada'?'v':'a',x.estado)),
+          el('td',{class:'n'},money(x.neto)),
+          el('td',{class:'mo'},fdate(x.fecha)),
+          el('td',{},el('button',{class:'b xs pri',onclick:()=>renumerar(x)},'Renumerar'))));
+      });
+      return;
+    }
+    tb.append(el('tr',{},
+      el('td',{class:'mo',style:'font-weight:600'},f.folio),
+      el('td',{},f.estado==='usado'?pill('a','usado'):f.estado==='reservado'?pill('m','reservado'):pill('g','libre')),
+      el('td',{},q?el('span',{},el('button',{class:'lk',onclick:()=>ir(q)},q.cuenta),
+          el('div',{class:'mi'},p?p.nombre:q.obra))
+        :f.res?el('span',{},el('span',{},f.res.para||'sin destino'),
+          f.res.nota?el('div',{class:'mi'},f.res.nota):null)
+        :el('span',{class:'mi'},'—')),
+      el('td',{},q?pill(q.estado==='Adjudicada'?'v':q.estado==='Perdida'?'r':'a',q.estado)
+        :f.res?el('span',{class:'mi'},'reservado el '+fdate(f.res.ts)):''),
+      el('td',{class:'n'},q?money(q.neto):''),
+      el('td',{class:'mo'},q?fdate(q.fecha):''),
+      el('td',{},q?el('button',{class:'b xs sutil',onclick:()=>renumerar(q)},'Renumerar')
+        :f.res?el('span',{},el('button',{class:'b xs',onclick:()=>crearCotizacion(null,null,f.folio)},'Usar'),' ',
+            el('button',{class:'b xs sutil',onclick:()=>liberarFolio(f.n)},'Liberar'))
+        :el('span',{},el('button',{class:'b xs',onclick:()=>reservarFolio(f.n)},'Reservar'),' ',
+            el('button',{class:'b xs sutil',onclick:()=>crearCotizacion(null,null,f.folio)},'Usar')))));
+  });
+  t.append(tb); host.append(t); card.append(host); w.append(card);
+  v.append(w);
+};
+
+/* ============================================================
    NAVEGACIÓN
    Cuatro secciones. Todo lo demás son vistas de un objeto, no destinos.
    La URL manda: se puede volver atrás, recargar y compartir un enlace.
@@ -2459,6 +2609,7 @@ function menuNuevo(anchor){
       {txt:'Cuenta',tecla:'N',fn:crearCuenta},
       {txt:'Proyecto',fn:()=>crearProyecto(cn)},
       {txt:'Cotización',fn:()=>crearCotizacion(cn)},
+      {txt:'Reservar un folio',fn:()=>reservarFolio(numFolio(siguienteFolioLibre()))},
       {txt:'Persona',fn:()=>crearContacto(cn)}]},
     {titulo:'Ir a',items:[
       {txt:'Calendario del mes',tecla:'A',fn:()=>{UI.horizonte='mes';irA({v:'hoy'});}},
@@ -2667,7 +2818,7 @@ function adderTarea(cn){
 }
 
 /* ============ CARTERA ============ */
-const VISTAS=[['tabla','Tabla'],['malla','Malla'],['embudo','Embudo'],['proyectos','Proyectos'],['personas','Personas']];
+const VISTAS=[['tabla','Tabla'],['malla','Malla'],['embudo','Embudo'],['proyectos','Proyectos'],['personas','Personas'],['folios','Folios']];
 VIEWS.cartera=function(v){
   const w=el('div',{class:'ancho rej'});
   const T=totales();
@@ -2719,7 +2870,8 @@ VIEWS.cartera=function(v){
     malla:()=>cuerpo.append(vMalla()),
     embudo:()=>cuerpo.append(vEmbudo()),
     proyectos:()=>cuerpo.append(vProyectos()),
-    personas:()=>cuerpo.append(vPersonas())}[UI.vista])();
+    personas:()=>cuerpo.append(vPersonas()),
+    folios:()=>{const d=el('div');VIEWS.folios(d);cuerpo.append(d);}}[UI.vista])();
 };
 function menuColumnas(anchor){
   if(!UI.cols)UI.cols=new Set(COLS.map(c=>c[0]));
@@ -3613,6 +3765,10 @@ function checks(){
   add('alta','Pedidos trabados por falta de datos de ingreso','Coordinación los va a devolver: es la brecha de proceso que estás documentando.',
     S.cotizaciones.filter(q=>q.estado==='Adjudicada'&&faltaIngreso(q).length&&avanceEjec(q)<1)
       .map(q=>q.folio+' (faltan '+faltaIngreso(q).length+')'));
+  add('alta','Folios duplicados','Dos cotizaciones con el mismo número: sus archivos se pisan y el cliente puede recibir dos ofertas distintas con la misma referencia.',
+    (()=>{const u={},d=[];S.cotizaciones.forEach(q=>{const n=String(q.folio);if(u[n])d.push(n+' · '+u[n]+' y '+q.cuenta);else u[n]=q.cuenta;});return [...new Set(d)];})());
+  add('baja','Huecos en la serie de folios','Números saltados. Suelen ser cotizaciones emitidas fuera del panel que nunca se registraron.',
+    (()=>{try{const r=registroFolios();return r.filas.filter(f=>f.estado==='libre'&&f.n<r.max).map(f=>f.folio);}catch(e){return [];}})());
   add('alta','Nunca se ha cerrado nada como perdido','Sin pérdidas registradas la tasa de cierre no existe.',
     S.cotizaciones.filter(q=>q.estado==='Perdida').length?[]:['0 perdidas sobre '+S.cotizaciones.length+' cotizaciones']);
   add('alta','Prioridad A sin ningún correo enviado','Cuentas declaradas importantes a las que nunca se les escribió.',
@@ -4625,6 +4781,8 @@ function cmdk(){
       {k:'crear',n:'Persona nueva',s:cn?'en '+cn:'',go:()=>crearContacto(cn)},
       {k:'crear',n:'Agendar una tarea',s:cn?'en '+cn:'para hoy',go:()=>agendarEn(iso(HOY),cn)},
       {k:'crear',n:'Tarea interna',s:'sin cuenta asociada',go:()=>agendarEn(iso(HOY),SIN_CUENTA)},
+      {k:'crear',n:'Reservar el folio siguiente',s:'para cotizar fuera del panel',
+       go:()=>reservarFolio(numFolio(siguienteFolioLibre()))},
       {k:'ir a',n:'Hoy',s:'la jornada',go:()=>{UI.horizonte='dia';irA({v:'hoy'});}},
       {k:'ir a',n:'Agenda de la semana',s:'tareas, vigencias y cierres',go:()=>{UI.horizonte='semana';irA({v:'hoy'});}},
       {k:'ir a',n:'Calendario del mes',s:'todo lo que se viene',go:()=>{UI.horizonte='mes';irA({v:'hoy'});}},
@@ -4637,6 +4795,7 @@ function cmdk(){
       {k:'vista',n:'Embudo de cotizaciones',s:'',go:()=>{UI.vista='embudo';irA({v:'cartera'});}},
       {k:'vista',n:'Todos los proyectos',s:'',go:()=>{UI.vista='proyectos';irA({v:'cartera'});}},
       {k:'vista',n:'Mapa de personas',s:'',go:()=>{UI.vista='personas';irA({v:'cartera'});}},
+      {k:'vista',n:'Registro de folios',s:'cuál sigue, cuáles chocan, cuáles faltan',go:()=>{UI.vista='folios';irA({v:'cartera'});}},
       {k:'vista',n:UI.densidad==='compacta'?'Filas cómodas':'Filas compactas',s:'',
        go:()=>{UI.densidad=UI.densidad==='compacta'?'comoda':'compacta';render();}},
       {k:'filtro',n:'Solo prioridad A',s:'',go:()=>{UI.fA={prio:'A - Alta',canal:'',seg:'',txt:'',arch:false};UI.vista='tabla';irA({v:'cartera'});}},
