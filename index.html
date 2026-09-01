@@ -757,7 +757,7 @@ async function registrarIncidencia(q){
     {k:'detalle',label:'Qué pasó y cómo se resolvió',type:'textarea'}],'Registrar');
   if(!r)return;
   mut('incidencia',()=>{ q.incidencias=q.incidencias||[];
-    q.incidencias.unshift({id:uid(),fecha:r.fecha,tipo:r.tipo,detalle:r.detalle});
+    q.incidencias.unshift({id:uid(),fecha:r.fecha,tipo:r.tipo,detalle:r.detalle,resuelto:false,resueltoTs:'',cierre:''});
     logB(q.cuenta,'incidencia','['+q.folio+'] '+r.tipo+(r.detalle?': '+r.detalle:''));
     if(r.tipo.indexOf('Rechazo ITO')===0)nuevaTarea(q.cuenta,'Responder rechazo ITO de '+q.folio+' (usar NT-ACMA-001)',iso(HOY),'mio',q.folio); });
   toast('Incidencia registrada');
@@ -1027,6 +1027,20 @@ function nuevaTarea(cn,texto,fecha,tipo,folio){
   S.tareas.push(t); return t;
 }
 const opcionesCuenta=()=>[SIN_CUENTA,...activas().map(c=>c.nombre)];
+/* mover algo de cuenta: pasa cuando un correo se aplicó al cliente equivocado
+   o cuando una tarea nació interna y después resultó ser de alguien */
+function selCuenta(obj,campo,alCambiar){
+  const s=el('select',{class:'inl',style:'max-width:250px',onchange:e=>{
+    const v=e.target.value===SIN_CUENTA?'':e.target.value;
+    if(v===obj[campo])return;
+    mut('mover de cuenta',()=>{obj[campo]=v; if(alCambiar)alCambiar(v);});
+  }});
+  opcionesCuenta().forEach(x=>{
+    const val=x===SIN_CUENTA?'':x;
+    s.append(el('option',{value:x,selected:val===(obj[campo]||'')?'':null},x));
+  });
+  return s;
+}
 function toggleTarea(t){
   mut(t.hecha?'reabrir tarea':'cerrar tarea',()=>{
     t.hecha=!t.hecha; t.hechaTs=t.hecha?iso(HOY):'';
@@ -1382,6 +1396,42 @@ async function cotizacionDesdePDF(file,cn,pid){
   if(q){ await guardarPDF(q,file); await archivarCotizacion(q,true); await escanearArchivo();
     UI.openProy=pr.pid; UI.openCot=q.qid; UI.docTab='doc'; irA({v:'proyecto',id:pr.pid}); }
   toast(r.folio.trim()+' registrada y su PDF archivado');
+}
+
+async function resolverIncidencia(q,x){
+  if(x.resuelto){ mut('reabrir incidencia',()=>{x.resuelto=false;x.resueltoTs='';}); return; }
+  const r=await ask('Cerrar la incidencia',[
+    {k:'cierre',label:'Cómo se resolvió',type:'textarea',value:x.cierre||'',
+     ph:'qué se hizo, con quién y qué acordaron'},
+    {k:'fecha',label:'Fecha en que quedó resuelta',type:'date',value:iso(HOY)}],'Marcar resuelta');
+  if(!r)return;
+  mut('resolver incidencia',()=>{
+    x.resuelto=true; x.resueltoTs=r.fecha||iso(HOY); x.cierre=r.cierre||'';
+    logB(q.cuenta,'incidencia','['+q.folio+'] resuelta: '+x.tipo+(r.cierre?' — '+r.cierre:''));
+  });
+  toast('Incidencia cerrada');
+}
+async function editarDespacho(q,dsp){
+  const r=await ask('Editar el despacho'+(dsp.guia?' '+dsp.guia:''),[
+    {k:'fecha',label:'Fecha',type:'date',value:dsp.fecha||''},
+    {k:'guia',label:'N° de guía',value:dsp.guia||''},
+    {k:'kg',label:'Kilos',type:'number',value:dsp.kg||''},
+    {k:'transporte',label:'Camión, patente y conductor',value:dsp.transporte||''},
+    {k:'estado',label:'Estado',type:'select',options:['programado','despachado','recibido conforme','rechazado','anulado'],value:dsp.estado},
+    {k:'nota',label:'Qué salió',type:'textarea',value:dsp.nota||''}],'Guardar');
+  if(!r)return;
+  mut('editar despacho',()=>{
+    Object.assign(dsp,{fecha:r.fecha,guia:r.guia,kg:Number(r.kg)||0,
+      transporte:r.transporte,estado:r.estado,nota:r.nota});
+    logB(q.cuenta,'ejecucion','['+q.folio+'] despacho corregido: '+num(r.kg)+' kg · '+r.estado+
+      '. Avance '+avanceDespacho(q).pct+'%.');
+  });
+}
+async function borrarDespacho(q,dsp){
+  if(!await confirmar('Borrar el despacho de '+num(dsp.kg)+' kg del '+fdate(dsp.fecha)+
+    '. El avance vuelve a recalcularse.','Borrar'))return;
+  mut('borrar despacho',()=>{ q.despachos=q.despachos.filter(x=>x!==dsp);
+    logB(q.cuenta,'ejecucion','['+q.folio+'] despacho borrado. Avance '+avanceDespacho(q).pct+'%.'); });
 }
 
 /* ---- crear / borrar ---- */
@@ -2875,10 +2925,16 @@ function filaTarea(t,conCuenta){
   mt.append(edit(t,'fecha',{type:'date',nombre:'fecha',fmt:s=>s?fdate(s):'sin fecha'}));
   if(!t.hecha&&d!==null)mt.append(pill(d<0?'r':d===0?'m':'g',d<0?Math.abs(d)+'d tarde':d===0?'hoy':d===1?'mañana':d+'d'));
   mt.append(edit(t,'tipo',{options:['mio','esperando'],nombre:'tipo',fmt:x=>x==='esperando'?'esperando a ellos':'mío'}));
-  if(conCuenta)mt.append(esInterna(t)
-    ? el('span',{class:'e g',title:'Tarea interna, no está asociada a ningún cliente'},'interno')
-    : el('button',{class:'lk',style:'font-size:11.5px',onclick:()=>abrir(t.cuenta,'tareas')},t.cuenta));
-  if(t.folio)mt.append(pill('a',t.folio));
+  if(conCuenta)mt.append(el('span',{style:'display:inline-flex;gap:4px;align-items:center'},
+    esInterna(t)
+      ? el('span',{class:'e g',title:'Tarea interna, no está asociada a ningún cliente'},'interno')
+      : el('button',{class:'lk',style:'font-size:11.5px',onclick:()=>abrir(t.cuenta,'tareas')},t.cuenta),
+    el('button',{class:'b xs sutil',title:'Mover a otra cuenta',style:'padding:0 5px;min-height:18px',
+      onclick:async()=>{const r=await ask('Mover «'+t.texto.slice(0,44)+'»',
+        [{k:'c',label:'A qué cuenta',type:'select',options:opcionesCuenta(),value:t.cuenta||SIN_CUENTA}],'Mover');
+        if(!r)return; mut('mover tarea de cuenta',()=>{t.cuenta=r.c===SIN_CUENTA?'':r.c;});}},'⇄')));
+  mt.append(edit(t,'folio',{nombre:'folio',ph:'sin folio',
+    fmt:x=>x||'',title:'Folio relacionado'}));
   b.append(mt);
   wr.append(b,el('div',{class:'ac'},
     t.hecha?null:el('button',{class:'b xs',onclick:()=>cerrarYAgendar(t)},'Cerrar y agendar'),
@@ -3948,6 +4004,9 @@ function pgProyecto(v,p){
     put('Mandante',edit(p,'mandante',{nombre:'mandante',ph:'añadir mandante'}));
     put('Inicio de obra',edit(p,'inicio',{type:'date',nombre:'fecha',fmt:x=>x?fdate(x):''}));
     put('Notas',edit(p,'notas',{multiline:true,blq:true,nombre:'notas',ph:'contexto de esta obra'}));
+    put('Coordenadas',el('span',{},edit(p,'lat',{nombre:'latitud',ph:'lat'}),
+      el('span',{class:'mi'},'  ·  '),edit(p,'lng',{nombre:'longitud',ph:'lng'}),
+      el('span',{class:'mi'},'  solo si necesitas precisión mayor que la comuna')));
     const per=contactosDe(p.cuenta);
     put('Personas',per.length?el('div',{},...per.map(x=>el('div',{style:'margin-bottom:3px'},
       x.nombre,' ',pill(x.rol==='Decide'?'v':'g',x.rol||'—'),
@@ -4030,6 +4089,84 @@ function pgProyecto(v,p){
   }
   w.append(extra);
   v.append(w);
+}
+
+/* ---------- fechas del ciclo, corregibles ---------- */
+function bloqueHitos(q){
+  const w=el('div',{style:'border-top:1px solid var(--linea)'});
+  w.append(el('div',{style:'display:flex;gap:9px;align-items:center;padding:11px var(--s4)'},
+    el('div',{class:'d4'},'Fechas del ciclo'),
+    el('span',{class:'mi'},'de estas fechas sale el cálculo de días parado'),
+    el('span',{style:'flex:1'}),
+    el('button',{class:'b xs',onclick:()=>datosProduccion(q)},'Pedido y Monday')));
+  const dl=el('dl',{class:'dl'}),put=(k,x)=>{dl.append(el('dt',{},k),el('dd',{},x));};
+  EJEC.forEach(e=>put(e,edit(q.hitos,HITO[e],{type:'date',nombre:'fecha de '+e.toLowerCase(),
+    fmt:x=>x?fdate(x):''})));
+  put('N° de pedido',edit(q,'pedido',{nombre:'pedido',ph:'añadir número de pedido'}));
+  put('Fabricación',edit(q.monday,'fabrica',{type:'date',nombre:'fecha',fmt:x=>x?fdate(x):''}));
+  put('Semana',edit(q.monday,'semana',{nombre:'semana',ph:'ej. S37'}));
+  put('Monday',edit(q.monday,'url',{nombre:'enlace',ph:'añadir enlace al tablero'}));
+  put('Nota de producción',edit(q.monday,'nota',{multiline:true,blq:true,nombre:'nota'}));
+  w.append(dl);
+  return w;
+}
+/* ---------- despachos parciales, editables ---------- */
+function bloqueDespachos(q){
+  const a=avanceDespacho(q), ds=q.despachos||[];
+  const w=el('div',{style:'border-top:1px solid var(--linea)'});
+  w.append(el('div',{style:'display:flex;gap:9px;align-items:center;padding:11px var(--s4);flex-wrap:wrap'},
+    el('div',{class:'d4'},'Despachos'),
+    pill(a.pct>=100?'v':a.pct?'a':'g',a.pct+'% · '+num(a.salido)+' de '+num(a.total)+' kg'),
+    a.falta?pill('m','faltan '+num(a.falta)+' kg'):null,
+    el('span',{style:'flex:1'}),
+    el('button',{class:'b xs pri',onclick:()=>registrarDespacho(q)},'Registrar despacho')));
+  if(!ds.length){ w.append(el('div',{style:'padding:0 var(--s4) var(--s4)'},
+    el('span',{class:'mi'},'Todavía no sale nada. Cada parcial que registres descuenta del total.'))); return w; }
+  const t=el('table',{class:'despt'},el('thead',{},el('tr',{},el('th',{},'Fecha'),el('th',{},'Guía'),
+    el('th',{style:'text-align:right'},'kg'),el('th',{},'Transporte'),el('th',{},'Estado'),
+    el('th',{},'Qué salió'),el('th',{style:'width:96px'},''))));
+  const tb=el('tbody');
+  ds.forEach(x=>tb.append(el('tr',{style:x.estado==='anulado'?'opacity:.5':''},
+    el('td',{},edit(x,'fecha',{type:'date',nombre:'fecha',fmt:y=>y?fdate(y):''})),
+    el('td',{class:'mo'},edit(x,'guia',{nombre:'guía',ph:'añadir guía'})),
+    el('td',{class:'n'},edit(x,'kg',{type:'number',nombre:'kg',fmt:num})),
+    el('td',{},edit(x,'transporte',{nombre:'transporte',blq:true})),
+    el('td',{},edit(x,'estado',{options:['programado','despachado','recibido conforme','rechazado','anulado'],nombre:'estado'})),
+    el('td',{},edit(x,'nota',{multiline:true,blq:true,nombre:'detalle'})),
+    el('td',{},el('button',{class:'b xs sutil',onclick:()=>editarDespacho(q,x)},'Editar'),' ',
+      el('button',{class:'b xs sutil peli',onclick:()=>borrarDespacho(q,x)},'×')))));
+  t.append(tb);
+  w.append(t);
+  return w;
+}
+/* ---------- incidencias y postventa, con cierre ---------- */
+function bloqueIncidencias(q){
+  const xs=q.incidencias||[];
+  const ab=xs.filter(x=>!x.resuelto).length;
+  const w=el('div',{style:'border-top:1px solid var(--linea)'});
+  w.append(el('div',{style:'display:flex;gap:9px;align-items:center;padding:11px var(--s4)'},
+    el('div',{class:'d4'},'Incidencias y postventa'),
+    xs.length?pill(ab?'m':'v',ab?ab+' sin resolver':'todas resueltas'):null,
+    el('span',{style:'flex:1'}),
+    el('button',{class:'b xs',onclick:()=>registrarIncidencia(q)},'Registrar incidencia')));
+  if(!xs.length){ w.append(el('div',{style:'padding:0 var(--s4) var(--s4)'},
+    el('span',{class:'mi'},'Sin incidencias. Un rechazo del ITO, una merma o un atraso se registran acá y quedan hasta que los cierres.'))); return w; }
+  xs.forEach(x=>{
+    const f=el('div',{style:'display:flex;gap:10px;padding:9px var(--s4);border-top:1px solid var(--linea);align-items:flex-start'+
+      (x.resuelto?';opacity:.6':'')});
+    f.append(el('input',{type:'checkbox',class:'ck',style:'margin-top:3px',checked:x.resuelto?'':null,
+      onchange:()=>resolverIncidencia(q,x)}));
+    f.append(el('div',{style:'flex:1;min-width:0'},
+      el('div',{class:'tx'},edit(x,'tipo',{nombre:'tipo',blq:true})),
+      el('div',{class:'tx2'},edit(x,'detalle',{multiline:true,blq:true,nombre:'detalle',ph:'qué pasó'})),
+      x.resuelto&&x.cierre?el('div',{class:'tx2',style:'color:var(--ok);margin-top:3px'},'Resuelta: '+x.cierre):null,
+      el('div',{class:'mt',style:'margin-top:4px'},edit(x,'fecha',{type:'date',nombre:'fecha',fmt:y=>fdate(y)}),
+        x.resuelto?pill('v','cerrada el '+fdate(x.resueltoTs)):pill('m','abierta'))));
+    f.append(el('div',{class:'ac'},el('button',{class:'b xs sutil peli',
+      onclick:()=>{if(confirm)mut('borrar incidencia',()=>{q.incidencias=q.incidencias.filter(y=>y!==x);});}},'×')));
+    w.append(f);
+  });
+  return w;
 }
 
 /* ---------- la hoja tal como la imprime el cotizador ---------- */
@@ -4184,20 +4321,31 @@ function docCotizacion(q){
   if(tab==='hoja'){ w.append(panelHoja(q)); return w; }
   if(tab==='proceso'){
     w.append(via(q));
-    if(q.estado==='Adjudicada')w.append(viaEjecucion(q),bloqueRequisitos(q));
-    if((q.incidencias||[]).length){
-      const inc=el('div',{style:'padding:var(--s3) var(--s5) var(--s4)'});
-      inc.append(el('div',{class:'d4',style:'margin-bottom:6px'},'Incidencias'));
-      q.incidencias.forEach(x=>inc.append(el('div',{style:'display:flex;gap:9px;padding:8px 0;border-top:1px solid var(--linea)'},
-        pill(x.tipo.indexOf('Rechazo')===0?'r':'m',fdate(x.fecha)),
-        el('div',{style:'flex:1'},el('div',{class:'tx'},x.tipo),x.detalle?el('div',{class:'tx2'},x.detalle):null))));
-      w.append(inc);
+    if(q.estado==='Adjudicada'){
+      w.append(viaEjecucion(q),bloqueRequisitos(q),bloqueHitos(q),bloqueDespachos(q));
     }
+    w.append(bloqueIncidencias(q));
     if(q.estado==='Adjudicada')w.append(el('div',{class:'adder'},
       el('button',{class:'b',onclick:()=>registrarIncidencia(q)},'Registrar incidencia')));
     return w;
   }
   if(tab==='revs'){
+    const rv=(q.revalidaciones||[]);
+    if(rv.length){
+      const t2=el('table',{class:'lin'},el('thead',{},el('tr',{},el('th',{},'Revalidada el'),
+        el('th',{},'Vencía'),el('th',{},'Nueva validez'),el('th',{},'Motivo'),el('th',{},'Detalle'),el('th',{}))));
+      const tb2=el('tbody');
+      rv.forEach(x=>tb2.append(el('tr',{},
+        el('td',{class:'mo'},fdate(x.ts)),el('td',{class:'mo'},fdate(x.desde)),
+        el('td',{class:'mo'},edit(x,'hasta',{type:'date',nombre:'validez',fmt:y=>fdate(y)})),
+        el('td',{},edit(x,'motivo',{nombre:'motivo'})),
+        el('td',{class:'tx2'},edit(x,'nota',{multiline:true,blq:true,nombre:'detalle'})),
+        el('td',{},el('button',{class:'b xs sutil peli',
+          onclick:()=>mut('borrar revalidación',()=>{q.revalidaciones=q.revalidaciones.filter(y=>y!==x);})},'×')))));
+      t2.append(tb2);
+      w.append(el('div',{style:'padding:var(--s4) var(--s5) 0'},
+        el('div',{class:'d4',style:'margin-bottom:6px'},'Revalidaciones de vigencia'),t2));
+    }
     const nv=(q.versiones||[]).length;
     if(!nv)w.append(vacio(ICO.cotizar,'Todavía no hay revisiones',
       'Cuando cambies el alcance o el precio, «Nueva revisión» congela la versión actual y te deja editar la siguiente bajo el mismo folio.',
@@ -4218,7 +4366,7 @@ function docCotizacion(q){
           el('td',{class:'n'},num(x.neto)),el('td',{class:'n'},num(x.kg)),
           el('td',{class:'n',style:'color:'+(d>0?'var(--ok)':d<0?'var(--mal)':'var(--t3)')},
             d?(d>0?'+':'')+money(d):'igual'),
-          el('td',{},x.estado),el('td',{class:'tx2'},x.motivo||'—'),
+          el('td',{},x.estado),el('td',{class:'tx2'},edit(x,'motivo',{multiline:true,blq:true,nombre:'motivo',ph:'qué cambió'})),
           el('td',{},el('button',{class:'b xs',onclick:()=>restaurarVersion(q,x)},'Restaurar'))));
       });
       t.append(tb); w.append(el('div',{style:'padding:var(--s4) var(--s5)'},t));
@@ -4232,7 +4380,7 @@ function docCotizacion(q){
     el('div',{},el('div',{class:'marca-doc'},'ACMA',el('small',{},'ACMA S.A. · RUT 92.190.000-7 · Maruri 1942, Renca'))),
     el('div',{class:'num-doc'},el('div',{class:'t'},'COTIZACIÓN'),
       el('div',{class:'f'},edit(q,'folio',{nombre:'folio'})),
-      el('div',{class:'r'},'Revisión ',String(q.rev||0)))));
+      el('div',{class:'r'},'Revisión ',edit(q,'rev',{type:'number',nombre:'revisión'})))));
 
   const cols=el('div',{class:'cols'});
   const bl=(titulo,filas)=>{const b=el('div',{class:'bloq'});b.append(el('h4',{},titulo));
