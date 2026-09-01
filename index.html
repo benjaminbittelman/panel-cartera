@@ -1004,7 +1004,7 @@ function menu(anchor,grupos){
 }
 
 /* ============ acciones de negocio ============ */
-function logB(cn,tipo,texto,ts){ S.bitacora.unshift({id:uid(),cuenta:cn,ts:ts||iso(HOY),tipo,texto}); }
+function logB(cn,tipo,texto,ts){ S.bitacora.unshift({id:uid(),cuenta:cn===SIN_CUENTA?'':(cn||''),ts:ts||iso(HOY),tipo,texto}); }
 
 function registrarContacto(c,quien){
   mut('registrar contacto',()=>{
@@ -1016,10 +1016,17 @@ function registrarContacto(c,quien){
   });
   toast('Contacto registrado en '+c.nombre);
 }
+const SIN_CUENTA='— interno, sin cuenta —';
+const esInterna=t=>!t.cuenta||t.cuenta===SIN_CUENTA;
+/* Una tarea no siempre nace de un cliente. Pedirle el maestro de datos a
+   Constanza o los permisos a René son compromisos reales que antes no
+   cabían en el CRM porque exigía una cuenta. */
 function nuevaTarea(cn,texto,fecha,tipo,folio){
-  const t={id:uid(),cuenta:cn,texto,tipo:tipo||'mio',fecha:fecha||iso(HOY),hecha:false,creada:iso(HOY),folio:folio||''};
+  const t={id:uid(),cuenta:(cn===SIN_CUENTA?'':cn||''),texto,tipo:tipo||'mio',
+    fecha:fecha||iso(HOY),hecha:false,creada:iso(HOY),folio:folio||''};
   S.tareas.push(t); return t;
 }
+const opcionesCuenta=()=>[SIN_CUENTA,...activas().map(c=>c.nombre)];
 function toggleTarea(t){
   mut(t.hecha?'reabrir tarea':'cerrar tarea',()=>{
     t.hecha=!t.hecha; t.hechaTs=t.hecha?iso(HOY):'';
@@ -1034,7 +1041,7 @@ async function cerrarYAgendar(t){
     {k:'f',label:'Para cuándo',type:'date',value:iso(new Date(HOY.getTime()+2*864e5))}],'Cerrar');
   if(!r)return;
   mut('cerrar tarea',()=>{ t.hecha=true; t.hechaTs=iso(HOY); logB(t.cuenta,'tarea',r.res||('Hecho: '+t.texto));
-    if(r.sig.trim())nuevaTarea(t.cuenta,r.sig.trim(),r.f,r.tipo,t.folio); });
+    if(r.sig.trim())nuevaTarea(t.cuenta||SIN_CUENTA,r.sig.trim(),r.f,r.tipo,t.folio); });
   toast('Cerrada');
 }
 async function marcarPerdida(q){
@@ -2029,10 +2036,11 @@ function eventos(){
 const evPorDia=(ev,f)=>ev.filter(e=>e.f===f).sort((a,b)=>
   ({mio:0,esp:1,vig:2,fab:3,cie:4}[a.tipo]||9)-({mio:0,esp:1,vig:2,fab:3,cie:4}[b.tipo]||9));
 
-async function agendarEn(fecha,cn){
+async function agendarEn(fecha,cn,texto){
   const r=await ask('Agendar el '+fdate(fecha),[
-    {k:'texto',label:'Qué hay que hacer',ph:'ej. llamar a Gustavo por la OC'},
-    {k:'cuenta',label:'Cuenta',type:'select',options:activas().map(c=>c.nombre),value:cn||activas()[0]?.nombre},
+    {k:'texto',label:'Qué hay que hacer',value:texto||'',ph:'ej. llamar a Gustavo por la OC'},
+    {k:'cuenta',label:'Cuenta (déjalo en interno si no es de un cliente)',type:'select',
+     options:opcionesCuenta(),value:cn||SIN_CUENTA},
     {k:'tipo',label:'Tipo',type:'select',options:['mio','esperando'],value:'mio'},
     {k:'folio',label:'Folio relacionado (opcional)'}],'Agendar');
   if(!r||!r.texto.trim())return;
@@ -2507,6 +2515,9 @@ VIEWS.hoy=function(v){
   pend.forEach(t=>c1.append(filaTarea(t,true)));
   c1.append(adderTarea(null));
 
+  /* lo interno no cuelga de ningún cliente y antes no tenía dónde vivir */
+  const internas=S.tareas.filter(t=>!t.hecha&&esInterna(t))
+    .sort((x,y)=>(x.fecha||'9999').localeCompare(y.fecha||'9999'));
   const c2=el('div',{class:'rej'});
   const cv=tarjeta('Vigencias que decidir',el('span',{class:'co'},String(vencidas.length+porVencer.length)));
   [...vencidas,...porVencer].sort((a,b)=>dias(a.validez)-dias(b.validez)).forEach(q=>{
@@ -2525,7 +2536,15 @@ VIEWS.hoy=function(v){
   const esp=S.tareas.filter(t=>!t.hecha&&t.tipo==='esperando').sort((a,b)=>(a.fecha||'').localeCompare(b.fecha||''));
   esp.slice(0,8).forEach(t=>ce.append(filaTarea(t,true)));
   if(!esp.length)ce.append(vacio(ICO.hoy,'Nada en su cancha','Cuando pidas algo y quedes esperando, agéndalo como «esperando».'));
-  c2.append(cv,ce);
+  const ci=tarjeta('Internas',el('span',{class:'co'},String(internas.length)),el('span',{class:'sp'}),
+    el('span',{class:'mi'},'lo que no es de ningún cliente'));
+  internas.slice(0,10).forEach(t=>ci.append(filaTarea(t,true)));
+  if(!internas.length)ci.append(vacio(ICO.hoy,'Sin pendientes internos',
+    'Lo que le debes a Diego, a René o a Fernando puede vivir acá sin colgar de un cliente.',
+    el('button',{class:'b pri',onclick:()=>agendarEn(iso(HOY),SIN_CUENTA)},'Agendar algo interno')));
+  else ci.append(el('div',{class:'adder'},
+    el('button',{class:'b',onclick:()=>agendarEn(iso(HOY),SIN_CUENTA)},'Agendar otra interna')));
+  c2.append(cv,ce,ci);
   g.append(c1,c2); w.append(g);
 
   w.append(tarjetaProduccion());
@@ -2626,7 +2645,9 @@ function filaTarea(t,conCuenta){
   mt.append(edit(t,'fecha',{type:'date',nombre:'fecha',fmt:s=>s?fdate(s):'sin fecha'}));
   if(!t.hecha&&d!==null)mt.append(pill(d<0?'r':d===0?'m':'g',d<0?Math.abs(d)+'d tarde':d===0?'hoy':d===1?'mañana':d+'d'));
   mt.append(edit(t,'tipo',{options:['mio','esperando'],nombre:'tipo',fmt:x=>x==='esperando'?'esperando a ellos':'mío'}));
-  if(conCuenta)mt.append(el('button',{class:'lk',style:'font-size:11.5px',onclick:()=>abrir(t.cuenta,'tareas')},t.cuenta));
+  if(conCuenta)mt.append(esInterna(t)
+    ? el('span',{class:'e g',title:'Tarea interna, no está asociada a ningún cliente'},'interno')
+    : el('button',{class:'lk',style:'font-size:11.5px',onclick:()=>abrir(t.cuenta,'tareas')},t.cuenta));
   if(t.folio)mt.append(pill('a',t.folio));
   b.append(mt);
   wr.append(b,el('div',{class:'ac'},
@@ -2637,7 +2658,7 @@ function filaTarea(t,conCuenta){
 }
 function adderTarea(cn){
   const inp=el('input',{class:'gr',placeholder:'Nueva tarea…  Enter para agregar'});
-  const sel=cn?null:el('select',{},...activas().map(c=>el('option',{value:c.nombre},c.nombre)));
+  const sel=cn?null:el('select',{},...opcionesCuenta().map(x=>el('option',{value:x},x)));
   const tipo=el('select',{},el('option',{value:'mio'},'mío'),el('option',{value:'esperando'},'esperando'));
   const fe=el('input',{type:'date',value:iso(HOY)});
   const add=()=>{const tx=inp.value.trim();if(!tx)return;mut('nueva tarea',()=>nuevaTarea(cn||sel.value,tx,fe.value,tipo.value));};
@@ -3603,7 +3624,8 @@ function checks(){
   add('media','Más de 15 días sin contacto','El canal se enfría y hay que reabrirlo desde cero.',
     activas().filter(c=>{const d=sinContacto(c);return d!==null&&d>15;}).map(c=>c.nombre+' ('+sinContacto(c)+'d)'));
   add('media','Tareas vencidas','La agenda deja de ser confiable en cuanto arrastra vencidos.',
-    S.tareas.filter(t=>!t.hecha&&dias(t.fecha)!==null&&dias(t.fecha)<0).map(t=>t.cuenta+' ('+Math.abs(dias(t.fecha))+'d)'));
+    S.tareas.filter(t=>!t.hecha&&dias(t.fecha)!==null&&dias(t.fecha)<0)
+      .map(t=>(esInterna(t)?'interna':t.cuenta)+' ('+Math.abs(dias(t.fecha))+'d)'));
   add('media','Cotizaciones sin kilos','El negocio se compara por $/kg; sin kg no hay control de precio.',
     S.cotizaciones.filter(q=>VIVA(q)&&!q.kg).map(q=>q.folio));
   add('media','Cotizaciones sin líneas de producto','Sin desglose no sabes qué familia vendes ni a qué precio.',
@@ -4294,12 +4316,37 @@ function filaCorreo(m,p){
   const ac=el('div',{class:'ac'});
   if(p.nuevos.length)ap(ac,el('button',{class:'b xs pri',onclick:()=>crearDesdeCorreo(m,p)},
     'Registrar '+p.nuevos[0]));
+  ap(ac,el('button',{class:'b xs',title:'Crear una tarea a partir de este correo, con o sin cuenta',
+    onclick:()=>agendarDesdeCorreo(m,p)},'Agendar'));
   if(p.cuenta)ap(ac,el('button',{class:'b xs'+(p.nuevos.length?'':' pri'),
     onclick:()=>mut('aplicar correo',()=>aplicarCorreo(m,p))},'Aplicar'));
   else ap(ac,el('button',{class:'b xs',onclick:()=>asignarCuenta(m)},'Asignar cuenta'));
   ap(ac,el('button',{class:'b xs sutil',onclick:()=>mut('descartar correo',()=>descartarCorreo(m))},'Descartar'));
   w.append(ac);
   return w;
+}
+
+/* un correo puede generar un seguimiento aunque no sea de ningún cliente:
+   un pedido de Diego, un aviso de Williams, algo que dijo Fernando */
+async function agendarDesdeCorreo(m,p){
+  const sug=String(m.asunto||'').replace(/^(re|rv|fwd?|rd)\s*:\s*/i,'').trim().slice(0,90);
+  const quien=m.dir==='out'?(m.para[0]||''):m.de;
+  const r=await ask('Agendar a partir de este correo',[
+    {k:'texto',label:'Qué hay que hacer',value:(m.dir==='out'?'Seguimiento: ':'Responder: ')+sug},
+    {k:'cuenta',label:'Cuenta (déjalo en interno si no es de un cliente)',type:'select',
+     options:opcionesCuenta(),value:p&&p.cuenta?p.cuenta.nombre:SIN_CUENTA},
+    {k:'tipo',label:'Tipo',type:'select',options:['mio','esperando'],value:m.dir==='out'?'esperando':'mio'},
+    {k:'fecha',label:'Para cuándo',type:'date',value:iso(new Date(HOY.getTime()+2*864e5))},
+    {k:'folio',label:'Folio relacionado',value:(p&&p.folios[0])||''},
+    {k:'archivar',label:'¿Sacar el correo de la bandeja?',type:'select',options:['Sí','No'],value:'Sí'}],'Agendar');
+  if(!r||!r.texto.trim())return;
+  mut('agendar desde el correo',()=>{
+    nuevaTarea(r.cuenta,r.texto.trim(),r.fecha,r.tipo,r.folio||'');
+    const dest=r.cuenta===SIN_CUENTA?'':r.cuenta;
+    logB(dest,'correo',(m.dir==='out'?'Enviado a '+quien:'Recibido de '+quien)+': '+m.asunto,m.fecha);
+    if(r.archivar==='Sí'){ if(p&&p.cuenta)aplicarCorreo(m,p); else descartarCorreo(m); }
+  });
+  toast('Agendado'+(r.cuenta===SIN_CUENTA?' como tarea interna':' en '+r.cuenta));
 }
 
 async function asignarCuenta(m){
@@ -4576,7 +4623,8 @@ function cmdk(){
       {k:'crear',n:'Proyecto nuevo',s:cn?'en '+cn:'',go:()=>crearProyecto(cn)},
       {k:'crear',n:'Cotización nueva',s:cn?'en '+cn:'',go:()=>crearCotizacion(cn)},
       {k:'crear',n:'Persona nueva',s:cn?'en '+cn:'',go:()=>crearContacto(cn)},
-      {k:'crear',n:'Agendar una tarea',s:'para hoy',go:()=>agendarEn(iso(HOY),cn)},
+      {k:'crear',n:'Agendar una tarea',s:cn?'en '+cn:'para hoy',go:()=>agendarEn(iso(HOY),cn)},
+      {k:'crear',n:'Tarea interna',s:'sin cuenta asociada',go:()=>agendarEn(iso(HOY),SIN_CUENTA)},
       {k:'ir a',n:'Hoy',s:'la jornada',go:()=>{UI.horizonte='dia';irA({v:'hoy'});}},
       {k:'ir a',n:'Agenda de la semana',s:'tareas, vigencias y cierres',go:()=>{UI.horizonte='semana';irA({v:'hoy'});}},
       {k:'ir a',n:'Calendario del mes',s:'todo lo que se viene',go:()=>{UI.horizonte='mes';irA({v:'hoy'});}},
@@ -4616,8 +4664,9 @@ function cmdk(){
           go:()=>{UI.openProy=q.proyecto;UI.openCot=q.qid;abrir(q.cuenta,'proyectos');}}));
       S.contactos.filter(p=>norm(p.nombre+p.cuenta).includes(n)).slice(0,4)
         .forEach(p=>items.push({k:'persona',n:p.nombre,s:p.cuenta+(p.cargo?' — '+p.cargo:''),go:()=>abrir(p.cuenta,'personas')}));
-      S.tareas.filter(t=>!t.hecha&&norm(t.texto+t.cuenta).includes(n)).slice(0,4)
-        .forEach(t=>items.push({k:'tarea',n:t.texto,s:t.cuenta+' · '+fdate(t.fecha),go:()=>abrir(t.cuenta,'tareas')}));
+      S.tareas.filter(t=>!t.hecha&&norm(t.texto+(t.cuenta||'interno')).includes(n)).slice(0,5)
+        .forEach(t=>items.push({k:'tarea',n:t.texto,s:(esInterna(t)?'interna':t.cuenta)+' · '+fdate(t.fecha),
+          go:()=>esInterna(t)?irA({v:'hoy'}):abrir(t.cuenta,'tareas')}));
       acciones().filter(a=>norm(a.n+a.k).includes(n)).slice(0,6).forEach(a=>items.push(a));
     } else items=acciones();
     sel=0; dibuja();
