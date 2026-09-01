@@ -1311,6 +1311,79 @@ async function cerrarPedido(q){
   toast(folioRev(q)+' cerrado');
 }
 
+
+/* ============================================================
+   COTIZACIÓN DESDE UN PDF EXTERNO
+   No todo se cotiza en el panel. Cuando la oferta se hizo por fuera,
+   el PDF es la única evidencia: de ahí nace la cotización y ahí queda
+   archivada con la clave correcta, sin renombrar nada a mano.
+   ============================================================ */
+function folioDeNombre(nombre){
+  const s=String(nombre||'').toUpperCase().replace(/\s+/g,'');
+  const m=s.match(/BB2026[\-_]?(\d{3})/);
+  return m?('BB2026-'+m[1]):'';
+}
+function revDeNombre(nombre){
+  const m=String(nombre||'').toUpperCase().match(/[_\s\-]R(?:EV)?\.?\s?(\d)\b/);
+  return m?+m[1]:0;
+}
+async function cotizacionDesdePDF(file,cn,pid){
+  if(!file||!/\.pdf$/i.test(file.name)){ toast('Tiene que ser un PDF'); return; }
+  const folioDet=folioDeNombre(file.name);
+  const revDet=revDeNombre(file.name);
+  const existente=folioDet?S.cotizaciones.find(q=>q.folio===folioDet):null;
+  const p=pid?proyecto(pid):null;
+  const cuentaBase=cn||p?.cuenta||activas()[0]?.nombre;
+  const proys=proyectosDe(cuentaBase);
+
+  if(existente){
+    if(!await confirmar('El folio '+folioDet+' ya existe en '+existente.cuenta+
+      '. ¿Adjuntar el PDF a esa cotización en vez de crear una nueva?','Adjuntar'))return;
+    if(await guardarPDF(existente,file)){ await escanearArchivo();
+      UI.openCot=existente.qid; UI.docTab='pdf';
+      if(existente.proyecto)irA({v:'proyecto',id:existente.proyecto}); else render();
+      toast('PDF adjuntado a '+folioRev(existente)); }
+    return;
+  }
+  const r=await ask('Registrar la cotización del PDF',[
+    {k:'folio',label:'Folio'+(folioDet?' (leído del nombre del archivo)':''),
+     value:folioDet||siguienteFolio()},
+    {k:'cuenta',label:'Cuenta',type:'select',options:activas().map(x=>x.nombre),value:cuentaBase},
+    {k:'proyecto',label:'Obra',type:'select',
+     options:['— crear proyecto nuevo —',...proys.map(x=>x.nombre)],
+     value:p?p.nombre:(proys[0]?.nombre||'— crear proyecto nuevo —')},
+    {k:'obra',label:'Alcance',ph:'qué cubre esta oferta'},
+    {k:'neto',label:'Total neto',type:'number',value:''},
+    {k:'kg',label:'Kilos totales',type:'number',value:''},
+    {k:'fecha',label:'Fecha de emisión',type:'date',value:iso(new Date(file.lastModified||Date.now()))},
+    {k:'validez',label:'Válida hasta',type:'date',value:''},
+    {k:'estado',label:'Etapa',type:'select',options:ETAPAS,value:'Enviada'}],'Registrar y archivar');
+  if(!r||!r.folio.trim())return;
+  let pr=S.proyectos.find(x=>x.cuenta===r.cuenta&&x.nombre===r.proyecto);
+  if(!pr){ pr=await crearProyecto(r.cuenta); if(!pr)return; }
+  let q=null;
+  mut('cotización desde PDF',()=>{
+    const c=cuenta(r.cuenta);
+    q={qid:uid(),folio:r.folio.trim(),rev:revDet,versiones:[],fecha:r.fecha||iso(HOY),cuenta:r.cuenta,
+      proyecto:pr.pid,obra:r.obra||pr.nombre,contacto:c?.contacto||'',email:c?.email||'',
+      emailContacto:c?.email||'',rut:'',producto:'',neto:Number(r.neto)||0,
+      kg:r.kg===''?null:Number(r.kg),validez:r.validez||'',estado:r.estado,prob:null,probManual:false,
+      oc:'',nota:'Registrada desde el PDF «'+file.name+'», emitida fuera del panel. Falta cargar el desglose.',
+      cierre:'',motivoPerdida:'',lineas:[],cond:JSON.parse(JSON.stringify(COND_DEF)),
+      ejecucion:'',hitos:{oc:'',coord:'',ingreso:'',programa:'',despacho:'',entrega:'',factura:'',cierre:''},
+      ingreso:{calendario:'',precioKilo:(r.kg&&r.neto)?Math.round(Number(r.neto)/Number(r.kg)):null,
+        direccion:'',contactoObra:'',segmento:'',camiones:''},
+      incidencias:[],revalidaciones:[],despachos:[],pedido:'',monday:{url:'',fabrica:'',semana:'',nota:''}};
+    S.cotizaciones.unshift(q);
+    S.folios=(S.folios||[]).filter(x=>x.n!==q.folio);
+    logB(r.cuenta,'cotizacion','['+q.folio+'] registrada desde el PDF externo «'+file.name+'».');
+    if(!Number(r.neto))nuevaTarea(r.cuenta,'Cargar el neto y las líneas de '+q.folio,iso(HOY),'mio',q.folio);
+  });
+  if(q){ await guardarPDF(q,file); await archivarCotizacion(q,true); await escanearArchivo();
+    UI.openProy=pr.pid; UI.openCot=q.qid; UI.docTab='doc'; irA({v:'proyecto',id:pr.pid}); }
+  toast(r.folio.trim()+' registrada y su PDF archivado');
+}
+
 /* ---- crear / borrar ---- */
 async function crearCuenta(){
   const r=await ask('Nueva cuenta',[
@@ -2602,6 +2675,11 @@ function pintaBarra(){
       S.ultimoBarrido?el('span',{style:'display:block;color:var(--t3)',title:'Última lectura del correo'},
         'correo '+hace(S.ultimoBarrido)):null));
 }
+function pedirPDFSuelto(cn){
+  const inp=el('input',{type:'file',accept:'application/pdf,.pdf',style:'display:none',
+    onchange:e=>{const f=e.target.files[0];if(f)cotizacionDesdePDF(f,cn,null);}});
+  document.body.append(inp); inp.click(); setTimeout(()=>inp.remove(),60000);
+}
 function menuNuevo(anchor){
   const cn=UI.ruta.v==='cuenta'?UI.ruta.id:null;
   menu(anchor,[
@@ -2609,6 +2687,7 @@ function menuNuevo(anchor){
       {txt:'Cuenta',tecla:'N',fn:crearCuenta},
       {txt:'Proyecto',fn:()=>crearProyecto(cn)},
       {txt:'Cotización',fn:()=>crearCotizacion(cn)},
+      {txt:'Cotización desde un PDF externo',fn:()=>pedirPDFSuelto(cn)},
       {txt:'Reservar un folio',fn:()=>reservarFolio(numFolio(siguienteFolioLibre()))},
       {txt:'Persona',fn:()=>crearContacto(cn)}]},
     {titulo:'Ir a',items:[
@@ -3303,9 +3382,13 @@ function tablaCotizaciones(p,c){
   const qs=cotsDeProy(p.pid).sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||''));
   const w=el('div',{});
   if(!qs.length){
-    w.append(vacio(ICO.cotizar,'Obra sin cotizar','Está identificada pero nadie le ha puesto precio.',
-      el('button',{class:'b pri',onclick:()=>crearCotizacion(c.nombre,p.pid)},'Cotizar esta obra'),
-      el('button',{class:'b',onclick:()=>abrirCotizador({cuenta:c.nombre,proyecto:p.pid})},'Usar el cotizador')));
+    const inp2=el('input',{type:'file',accept:'application/pdf,.pdf',style:'display:none',
+      onchange:e=>{const f=e.target.files[0];e.target.value='';cotizacionDesdePDF(f,c.nombre,p.pid);}});
+    w.append(vacio(ICO.cotizar,'Obra sin cotizar',
+      'Está identificada pero nadie le ha puesto precio. Si ya la cotizaste por fuera, arrastra el PDF aquí y queda registrada con su archivo.',
+      el('button',{class:'b pri',onclick:()=>abrirCotizador({cuenta:c.nombre,proyecto:p.pid})},'Cotizar'),
+      el('button',{class:'b',onclick:()=>crearCotizacion(c.nombre,p.pid)},'Crear vacía'),
+      el('button',{class:'b',onclick:()=>inp2.click()},'Subir un PDF'),inp2));
     return w;
   }
   const t=el('table',{class:'cots'},el('thead',{},el('tr',{},
@@ -3331,8 +3414,24 @@ function tablaCotizaciones(p,c){
         style:'cursor:pointer',title:estadoDoc(q).pdf?'Ver el PDF':'Adjuntar el PDF'},
         estadoDoc(q).pdf?pill('v','✓'):pill('r','—')),
       el('td',{onclick:ev=>ev.stopPropagation()},
-        el('button',{class:'b xs'+(d!==null&&d<0&&VIVA(q)?' pri':''),onclick:()=>recotizar(q)},'Recotizar'),' ',
-        el('button',{class:'b xs sutil',title:'Copiar a un folio nuevo',onclick:()=>duplicarCotizacion(q)},'Duplicar'))));
+        /* solo aparece el botón que corresponde al estado real de la oferta */
+        (d!==null&&d<0&&VIVA(q))?el('button',{class:'b xs pri',title:'Extender la vigencia sin cambiar el precio',
+            onclick:()=>revalidar(q)},'Revalidar')
+        :(q.estado==='En negociación')?el('button',{class:'b xs pri',onclick:()=>recotizar(q)},'Recotizar')
+        :(q.estado==='Adjudicada'&&!q.ejecucion)?el('button',{class:'b xs pri',onclick:()=>setEjecucion(q,'OC recibida')},'Iniciar pedido')
+        :null,' ',
+        el('button',{class:'b xs ico',title:'Más',onclick:ev=>menu(ev.currentTarget,[
+          {titulo:folioRev(q),items:[
+            VIVA(q)?{txt:'Revalidar la vigencia',fn:()=>revalidar(q)}:null,
+            {txt:'Recotizar',fn:()=>recotizar(q)},
+            {txt:'Duplicar a un folio nuevo',fn:()=>duplicarCotizacion(q)},
+            {txt:estadoDoc(q).pdf?'Ver el PDF archivado':'Adjuntar el PDF',
+             fn:()=>{UI.openCot=q.qid;UI.docTab='pdf';render();}},
+            {txt:'Abrir en el cotizador',fn:()=>abrirCotizador({cuenta:q.cuenta,proyecto:q.proyecto,qid:q.qid})}].filter(Boolean)},
+          {titulo:'Cerrar la oferta',items:[
+            VIVA(q)?{txt:'Marcar adjudicada',fn:()=>setEstadoCot(q,'Adjudicada')}:null,
+            VIVA(q)?{txt:'Marcar perdida',fn:()=>marcarPerdida(q)}:null,
+            {txt:'Borrar',fn:()=>borrar('cotizacion',q)}].filter(Boolean)}])},'···'))));
   });
   const vv=qs.filter(VIVA);
   t.append(tb,el('tfoot',{},el('tr',{},el('td',{colspan:'4',style:'font-weight:600;background:var(--panel2)'},
@@ -3860,20 +3959,34 @@ function pgProyecto(v,p){
 
   /* ---- el centro de la hoja: las cotizaciones ---- */
   const card=el('div',{class:'c'});
-  const ultima=qs.filter(VIVA).sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||''))[0]||qs[0];
   const venc=qs.filter(q=>VIVA(q)&&dias(q.validez)!==null&&dias(q.validez)<0);
+  const conPdf=qs.filter(x=>estadoDoc(x).pdf).length;
+  const inp=el('input',{type:'file',accept:'application/pdf,.pdf',style:'display:none',
+    onchange:e=>{const f=e.target.files[0];e.target.value='';cotizacionDesdePDF(f,p.cuenta,p.pid);}});
   card.append(el('header',{},el('h3',{},'Cotizaciones'),el('span',{class:'co'},String(qs.length)),
     venc.length?pill('r',venc.length+' vencida'+(venc.length>1?'s':'')):null,
-    (()=>{const n=qs.filter(x=>estadoDoc(x).pdf).length;
-      return qs.length?el('span',{class:'mi',title:'PDF archivados en Cartera BB/cotizaciones_pdf'},
-        n+' de '+qs.length+' con PDF'):null;})(),
+    qs.length?el('span',{class:'mi',title:'PDF archivados en Cartera BB/cotizaciones_pdf'},
+      conPdf+' de '+qs.length+' con PDF'):null,
     el('span',{class:'sp'}),
-    ultima?el('button',{class:'b pri',onclick:()=>recotizar(ultima)},'Recotizar '+folioRev(ultima)):null,
-    el('button',{class:'b',onclick:()=>crearCotizacion(p.cuenta,p.pid)},'Nueva cotización'),
-    el('button',{class:'b',onclick:()=>abrirCotizador({cuenta:p.cuenta,proyecto:p.pid})},'Cotizador')));
+    el('button',{class:'b pri',onclick:e=>menu(e.currentTarget,[
+      {titulo:'Nueva oferta para '+p.nombre,items:[
+        {txt:'Cotizar en el cotizador',fn:()=>abrirCotizador({cuenta:p.cuenta,proyecto:p.pid})},
+        {txt:'Crear vacía y cargar las líneas aquí',fn:()=>crearCotizacion(p.cuenta,p.pid)},
+        {txt:'Subir el PDF de una hecha por fuera',fn:()=>inp.click()}]}])},
+      'Nueva oferta'),inp,
+    el('button',{class:'b ico',title:'Más',onclick:e=>menu(e.currentTarget,[
+      {titulo:'Cotizaciones',items:[
+        {txt:'Reservar un folio para cotizar afuera',fn:()=>reservarFolio(numFolio(siguienteFolioLibre()))},
+        {txt:'Archivar todas en la carpeta',fn:()=>archivarLote(qs)}]}])},'···')));
   if(venc.length)card.append(el('div',{class:'bloqueo'},'⚠',
     el('div',{},venc.map(q=>folioRev(q)).join(', ')+(venc.length>1?' están vencidas':' está vencida')+
       '. Recotizar copia las líneas, te deja aplicar un ajuste de precio en un solo paso y archiva la versión anterior.')));
+  ['dragenter','dragover'].forEach(ev=>card.addEventListener(ev,e=>{e.preventDefault();
+    card.style.outline='2px dashed var(--acc)';card.style.outlineOffset='4px';}));
+  ['dragleave','drop'].forEach(ev=>card.addEventListener(ev,e=>{e.preventDefault();card.style.outline='';}));
+  card.addEventListener('drop',e=>{e.preventDefault();card.style.outline='';
+    const f=(e.dataTransfer.files||[])[0];
+    if(f&&/\.pdf$/i.test(f.name))cotizacionDesdePDF(f,p.cuenta,p.pid);});
   card.append(tablaCotizaciones(p,c||{nombre:p.cuenta}));
   w.append(card);
 
@@ -4781,6 +4894,8 @@ function cmdk(){
       {k:'crear',n:'Persona nueva',s:cn?'en '+cn:'',go:()=>crearContacto(cn)},
       {k:'crear',n:'Agendar una tarea',s:cn?'en '+cn:'para hoy',go:()=>agendarEn(iso(HOY),cn)},
       {k:'crear',n:'Tarea interna',s:'sin cuenta asociada',go:()=>agendarEn(iso(HOY),SIN_CUENTA)},
+      {k:'crear',n:'Cotización desde un PDF externo',s:'la hiciste por fuera y hay que registrarla',
+       go:()=>pedirPDFSuelto(cn)},
       {k:'crear',n:'Reservar el folio siguiente',s:'para cotizar fuera del panel',
        go:()=>reservarFolio(numFolio(siguienteFolioLibre()))},
       {k:'ir a',n:'Hoy',s:'la jornada',go:()=>{UI.horizonte='dia';irA({v:'hoy'});}},
