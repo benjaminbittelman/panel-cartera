@@ -800,6 +800,14 @@ function migrar(st){
   st.tareas=st.tareas||[];
   st.proyectos=st.proyectos||[];
   st.correos=st.correos||[]; st.vistos=st.vistos||[]; st.folios=st.folios||[];
+  /* dos cotizaciones con el mismo folio y la misma revisión no son dos ofertas:
+     es una copia accidental, y sus archivos y sus kilos se cuentan dos veces */
+  (function(){const v={},dup=[];
+    (st.cotizaciones||[]).forEach(q=>{const k=q.folio+'_r'+(q.rev||0);
+      if(v[k])dup.push(k); else v[k]=1;});
+    if(dup.length)setTimeout(()=>toast(dup.length+' cotización(es) duplicada(s) exacta(s): '+
+      [...new Set(dup)].join(', ')+'. Revisa Cartera → Folios.',
+      ['Ver folios',()=>{UI.vista='folios';irA({v:'cartera'});}]),1200);})();
   if(st.autoAplicar===undefined)st.autoAplicar=true;
   if(st.ultimoBarrido===undefined)st.ultimoBarrido='';
   if(st.autoDescartarInternos===undefined)st.autoDescartarInternos=false;
@@ -1674,8 +1682,16 @@ function importarLibro(buf){
     if(hl>=0){ const L=LI[hl],g6=(...n)=>colIdx(L,...n);
       const ml={folio:g6('Folio'),cuenta:g6('Cuenta'),familia:g6('Familia'),producto:g6('Descripción','Producto'),
         kg:g6('kg'),precioKg:g6('$/kg'),monto:g6('Monto fijo')};
+      /* con folios duplicados, find() manda todas las líneas a la primera coincidencia
+         y las reparte mal. Se recorren en orden y se van llenando por turno. */
+      const usados={};
       for(let i=hl+1;i<LI.length;i++){ const r=LI[i]||[]; const f=celTxt(r[ml.folio]); if(!f)continue;
-        const q=cots.find(x=>x.folio===f&&(ml.cuenta<0||x.cuenta===celTxt(r[ml.cuenta])));
+        const cands=cots.filter(x=>x.folio===f&&(ml.cuenta<0||x.cuenta===celTxt(r[ml.cuenta])));
+        if(!cands.length)continue;
+        const clave=f+'|'+(ml.cuenta<0?'':celTxt(r[ml.cuenta]))+'|'+
+          [celTxt(r[ml.familia]),celTxt(r[ml.producto]),celNum(r[ml.kg]),celNum(r[ml.precioKg])].join('~');
+        const n=usados[clave]=(usados[clave]||0)+1;
+        const q=cands[Math.min(n-1,cands.length-1)];
         if(!q)continue;
         q.lineas.push({id:uid(),familia:celTxt(r[ml.familia])||'Otro',producto:celTxt(r[ml.producto]),
           kg:celNum(r[ml.kg])||null,precioKg:celNum(r[ml.precioKg])||null,monto:celNum(r[ml.monto])||null}); } } }
@@ -3136,6 +3152,75 @@ async function renumerar(q){
   toast('Ahora es '+nuevo+'. Ojo: los archivos guardados con el nombre anterior hay que renombrarlos.');
 }
 
+
+/* ============================================================
+   FUSIONAR UN DUPLICADO
+   Cuando una oferta se vence y se vuelve a emitir, a veces termina
+   como dos registros con el mismo folio en vez de una revisión.
+   Esto pliega la vieja dentro del historial de la vigente: no se
+   pierde nada y el folio deja de estar duplicado.
+   ============================================================ */
+async function fusionarDuplicado(a,b){
+  const orden=[a,b].sort((x,y)=>(y.fecha||'').localeCompare(x.fecha||'')||((y.rev||0)-(x.rev||0)));
+  const sug=orden[0], otra=orden[1];
+  const r=await ask('Fusionar las dos '+a.folio,[
+    {k:'vigente',label:'¿Cuál es la que vale hoy?',type:'select',
+     options:[etiquetaCot(sug),etiquetaCot(otra)],value:etiquetaCot(sug)},
+    {k:'motivo',label:'Qué pasó con la anterior',type:'select',
+     options:['Se venció y se volvió a emitir','Se actualizó el precio','Cambió el alcance',
+              'Es una copia accidental, descartar sin guardar','Otro'],
+     value:'Se venció y se volvió a emitir'},
+    {k:'nota',label:'Detalle',type:'textarea'}],'Fusionar');
+  if(!r)return;
+  const vig=r.vigente===etiquetaCot(sug)?sug:otra;
+  const vieja=vig===sug?otra:sug;
+  const descartar=r.motivo.indexOf('copia accidental')===0;
+  mut('fusionar duplicado',()=>{
+    if(!descartar){
+      vig.versiones=vig.versiones||[];
+      /* si la vieja ya traía historial propio, se conserva completo */
+      (vieja.versiones||[]).forEach(v=>{ if(!vig.versiones.some(x=>x.rev===v.rev&&x.ts===v.ts))vig.versiones.push(v); });
+      const yaEsta=vig.versiones.some(v=>v.fecha===vieja.fecha&&v.neto===vieja.neto);
+      if(!yaEsta)vig.versiones.unshift({rev:vieja.rev||0,ts:iso(HOY),fecha:vieja.fecha,
+        neto:vieja.neto,kg:vieja.kg,validez:vieja.validez,estado:vieja.estado,
+        lineas:JSON.parse(JSON.stringify(vieja.lineas||[])),nota:vieja.nota||'',
+        motivo:r.motivo+(r.nota?' · '+r.nota:'')});
+      vig.versiones.sort((x,y)=>(y.rev||0)-(x.rev||0));
+      if((vig.rev||0)<=(vieja.rev||0))vig.rev=(vieja.rev||0)+1;
+    }
+    /* si la vigente quedó sin líneas, se queda con las de la vieja */
+    if(!(vig.lineas||[]).length&&(vieja.lineas||[]).length)
+      vig.lineas=JSON.parse(JSON.stringify(vieja.lineas));
+    /* y se quitan las líneas repetidas, que es lo que estaba duplicando los kilos */
+    (function(){
+      const visto={},limpias=[];
+      (vig.lineas||[]).forEach(l=>{
+        const k=[l.familia,l.producto,l.kg,l.precioKg,l.monto].join('|');
+        if(visto[k])return; visto[k]=1; limpias.push(l);});
+      const quitadas=(vig.lineas||[]).length-limpias.length;
+      vig.lineas=limpias;
+      if(quitadas){ recalcNeto(vig);
+        logB(vig.cuenta,'cotizacion','['+vig.folio+'] se quitaron '+quitadas+
+          ' línea(s) repetida(s) al fusionar. Neto recalculado: '+money(vig.neto)+'.'); }
+    })();
+    /* lo que colgaba de la vieja pasa a la vigente */
+    (vieja.incidencias||[]).forEach(x=>{vig.incidencias=vig.incidencias||[];vig.incidencias.push(x);});
+    (vieja.revalidaciones||[]).forEach(x=>{vig.revalidaciones=vig.revalidaciones||[];vig.revalidaciones.push(x);});
+    (vieja.entregas||[]).forEach(x=>{vig.entregas=vig.entregas||[];vig.entregas.push(x);});
+    if(!vig.oc&&vieja.oc)vig.oc=vieja.oc;
+    if(!vig.pedido&&vieja.pedido)vig.pedido=vieja.pedido;
+    if(!vig.ejecucion&&vieja.ejecucion)vig.ejecucion=vieja.ejecucion;
+    S.cotizaciones=S.cotizaciones.filter(x=>x!==vieja);
+    logB(vig.cuenta,'cotizacion','['+vig.folio+'] se fusionaron dos registros del mismo folio. '+
+      (descartar?'La copia del '+fdate(vieja.fecha)+' se descartó sin guardar.'
+        :'La del '+fdate(vieja.fecha)+' por '+money(vieja.neto)+' quedó como revisión r'+(vieja.rev||0)+'. Motivo: '+r.motivo)+
+      (r.nota?' '+r.nota:''));
+  });
+  toast(descartar?'Copia descartada':'Fusionadas. La anterior quedó en el historial de revisiones.');
+}
+const etiquetaCot=q=>'r'+(q.rev||0)+' · '+fdate(q.fecha)+' · '+q.estado+' · vence '+
+  (q.validez?fdate(q.validez):'sin fecha')+' · '+money(q.neto);
+
 VIEWS.folios=function(v){
   const w=el('div',{class:'ancho rej'});
   const r=registroFolios();
@@ -3150,7 +3235,9 @@ VIEWS.folios=function(v){
 
   if(r.duplicados)w.append(el('div',{class:'c'},el('div',{class:'bloqueo',style:'margin:var(--s4)'},'⚠',
     el('div',{},'Hay ',el('strong',{},r.duplicados+' folio(s) duplicado(s)'),
-      '. Mientras estén repetidos, el archivo documental de una cotización pisa el de la otra, porque ambas guardan con la misma clave. Renumera una de las dos.'))));
+      '. Mientras estén repetidos, el archivo documental de una pisa el de la otra y sus montos se cuentan dos veces. ',
+      el('strong',{},'Fusionar'),' es lo correcto cuando la oferta se venció y se volvió a emitir: la anterior queda como revisión. ',
+      el('strong',{},'Renumerar'),' es para cuando son dos ofertas distintas que por error comparten número.'))));
 
   const card=el('div',{class:'c'});
   card.append(el('header',{},el('h3',{},'Serie de folios'),
@@ -3178,7 +3265,12 @@ VIEWS.folios=function(v){
           el('td',{},pill(x.estado==='Adjudicada'?'v':'a',x.estado)),
           el('td',{class:'n'},money(x.neto)),
           el('td',{class:'mo'},fdate(x.fecha)),
-          el('td',{},el('button',{class:'b xs pri',onclick:()=>renumerar(x)},'Renumerar'))));
+          el('td',{},k===0&&f.dups.length===2
+            ? el('span',{},el('button',{class:'b xs pri',
+                title:'Plegar la más antigua como revisión de la vigente',
+                onclick:()=>fusionarDuplicado(f.dups[0],f.dups[1])},'Fusionar'),' ',
+              el('button',{class:'b xs',onclick:()=>renumerar(x)},'Renumerar'))
+            : el('button',{class:'b xs',onclick:()=>renumerar(x)},'Renumerar'))));
       });
       return;
     }
@@ -5504,7 +5596,7 @@ async function crearDesdeCorreo(m,p,folioPedido){
    Siempre con vista previa antes de tocar nada, y siempre reversible.
    Pensado para que un asistente genere el lote y tú solo lo revises.
    ============================================================ */
-const OPS=['cuenta','contacto','proyecto','cotizacion','tarea','nota','ejecucion'];
+const OPS=['cuenta','contacto','proyecto','cotizacion','tarea','nota','ejecucion','borrar'];
 
 function normalizarLote(txt){
   let j;
@@ -5542,6 +5634,7 @@ function planLote(j){
       const q=S.cotizaciones.find(x=>x.folio===o.folio&&(!o.cuenta||x.cuenta===o.cuenta));
       r.accion=q?'actualiza':'crea';
       const n=(o.lineas||[]).reduce((a,l)=>a+(Number(l.kg)||0)*(Number(l.precioKg)||0)+(Number(l.monto)||0),0);
+      if(o.versiones&&o.versiones.length)r.detalle+=' · +'+o.versiones.length+' revisión(es) al historial';
       r.detalle=o.folio+' · '+(o.cuenta||'?')+(n?' · '+money(n):'');
       if(o.neto&&n&&Math.abs(o.neto-n)>Math.max(1000,o.neto*0.005))
         r.aviso='el neto declarado ('+money(o.neto)+') no cuadra con las líneas ('+money(n)+')';
@@ -5551,6 +5644,13 @@ function planLote(j){
     }
     if(o.op==='tarea'){ r.accion='crea'; r.detalle=String(o.texto||'').slice(0,64)+' → '+o.cuenta; }
     if(o.op==='nota'){ r.accion='crea'; r.detalle=String(o.texto||'').slice(0,64)+' → '+o.cuenta; }
+    if(o.op==='borrar'){
+      const objetivos=blancoBorrado(o);
+      r.accion=objetivos.length?'BORRA':'no aplica';
+      r.detalle=(o.que||'?')+' '+(o.folio||o.nombre||'')+' · '+objetivos.length+' encontrado(s)';
+      if(objetivos.length>1)r.aviso='hay '+objetivos.length+' que calzan: se borra el que indique el criterio';
+      if(!objetivos.length)r.aviso='no encontré nada que calce';
+    }
     if(o.op==='ejecucion'){
       const q=S.cotizaciones.find(x=>x.folio===o.folio);
       r.accion=q?'actualiza':'no aplica'; r.detalle=o.folio+' → '+(o.estado||'');
@@ -5561,6 +5661,19 @@ function planLote(j){
   return plan;
 }
 
+/* qué se borraría: el criterio debe ser lo bastante estrecho para no llevarse otra cosa */
+function blancoBorrado(o){
+  if(o.que==='cotizacion'){
+    return S.cotizaciones.filter(q=>
+      (!o.folio||q.folio===o.folio)&&(!o.cuenta||q.cuenta===o.cuenta)&&
+      (o.rev===undefined||(q.rev||0)===o.rev)&&(!o.fecha||q.fecha===o.fecha));
+  }
+  if(o.que==='proyecto')return S.proyectos.filter(p=>(!o.cuenta||p.cuenta===o.cuenta)&&p.nombre===o.nombre);
+  if(o.que==='contacto')return S.contactos.filter(p=>(!o.cuenta||p.cuenta===o.cuenta)&&p.nombre===o.nombre);
+  if(o.que==='cuenta')return S.cuentas.filter(c=>c.nombre===o.nombre);
+  if(o.que==='tarea')return S.tareas.filter(t=>t.texto===o.texto);
+  return [];
+}
 function ejecutarLote(j){
   const res={creados:0,actualizados:0,omitidos:0};
   const pick=(o,ks)=>{const x={};ks.forEach(k=>{if(o[k]!==undefined)x[k]=o[k];});return x;};
@@ -5604,7 +5717,8 @@ function ejecutarLote(j){
           ingreso:{calendario:'',precioKilo:null,direccion:'',contactoObra:'',segmento:'',camiones:''},incidencias:[]};
         S.cotizaciones.unshift(q); res.creados++;
       } else res.actualizados++;
-      Object.assign(q,pick(o,['fecha','obra','contacto','emailContacto','rut','validez','estado','oc','nota','cierre','rev']));
+      Object.assign(q,pick(o,['fecha','obra','contacto','emailContacto','rut','validez','estado','oc','nota','cierre','rev','pedido']));
+      if(o.monday)q.monday=Object.assign(q.monday||{},o.monday);
       if(pr)q.proyecto=pr.pid;
       if(o.lineas&&o.lineas.length){
         q.lineas=o.lineas.map(l=>({id:uid(),familia:l.familia||'Otro',producto:l.producto||'',
@@ -5612,7 +5726,15 @@ function ejecutarLote(j){
         recalcNeto(q);
       }
       if(o.neto!==undefined&&(!o.lineas||!o.lineas.length))q.neto=Number(o.neto)||0;
-      if(o.kg!==undefined&&(!o.lineas||!o.lineas.length))q.kg=o.kg;
+      /* los kilos declarados mandan cuando las líneas van por monto y no por peso,
+         que es el caso de todo lo Acmanet: se vende por unidad, no por kilo */
+      const lineasConKg=(o.lineas||[]).some(l2=>Number(l2.kg)>0);
+      if(o.kg!==undefined&&!lineasConKg)q.kg=o.kg;
+      if(o.versiones&&o.versiones.length){
+        q.versiones=q.versiones||[];
+        o.versiones.forEach(v=>{ if(!q.versiones.some(x=>x.fecha===v.fecha&&x.neto===v.neto))q.versiones.push(v); });
+        q.versiones.sort((a2,b2)=>(b2.rev||0)-(a2.rev||0));
+      }
       if(o.cond)Object.assign(q.cond,o.cond);
       if(o.ingreso)Object.assign(q.ingreso,o.ingreso);
     }
@@ -5620,6 +5742,31 @@ function ejecutarLote(j){
       nuevaTarea(o.cuenta,o.texto,o.fecha||iso(HOY),o.tipo||'mio',o.folio||''); res.creados++;
     }
     if(o.op==='nota'){ logB(o.cuenta,o.tipo||'nota',o.texto,o.ts); res.creados++; }
+    if(o.op==='borrar'){
+      const objetivos=blancoBorrado(o);
+      if(!objetivos.length){ res.omitidos++; return; }
+      const uno=objetivos[0];
+      if(o.que==='cotizacion'){ S.cotizaciones=S.cotizaciones.filter(x=>x!==uno);
+        logB(uno.cuenta,'cotizacion','['+uno.folio+'] eliminada del CRM. '+(o.motivo||'')); }
+      if(o.que==='proyecto')S.proyectos=S.proyectos.filter(x=>x!==uno);
+      if(o.que==='contacto')S.contactos=S.contactos.filter(x=>x!==uno);
+      if(o.que==='cuenta')S.cuentas=S.cuentas.filter(x=>x!==uno);
+      if(o.que==='tarea')S.tareas=S.tareas.filter(x=>x!==uno);
+      res.actualizados++; return;
+    }
+    if(o.op==='borrar'){
+      const objetivos=blancoBorrado(o);
+      if(!objetivos.length){ res.omitidos++; return; }
+      const uno=objetivos[0];
+      if(o.que==='cotizacion'){ S.cotizaciones=S.cotizaciones.filter(x=>x!==uno);
+        logB(uno.cuenta,'cotizacion','['+uno.folio+'] eliminada del CRM. '+(o.motivo||'')); }
+      if(o.que==='proyecto')S.proyectos=S.proyectos.filter(x=>x!==uno);
+      if(o.que==='contacto')S.contactos=S.contactos.filter(x=>x!==uno);
+      if(o.que==='cuenta')S.cuentas=S.cuentas.filter(x=>x!==uno);
+      if(o.que==='tarea')S.tareas=S.tareas.filter(x=>x!==uno);
+      res.actualizados++;
+      return;
+    }
     if(o.op==='ejecucion'){
       const q=S.cotizaciones.find(x=>x.folio===o.folio);
       if(!q){ res.omitidos++; return; }
