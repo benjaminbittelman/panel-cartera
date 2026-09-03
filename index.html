@@ -667,7 +667,7 @@ let S=null, saveT=null, UNDO=[], UI={
   q:'', sortC:{key:'venc',dir:1}, sortA:{key:'urg',dir:1},
   fA:{prio:'',canal:'',seg:'',txt:'',arch:false}, fQ:{estado:'',txt:''},
   cols:null, sel:new Set(), dtab:'resumen', openProy:null, openCot:null,
-  editFicha:false, abrirReq:null, verCheck:null, docTab:'doc', verFicha:false, verResumen:false, verBandaCot:false, horizonte:'mes', calMes:null, calSem:null, verCerradas:false};
+  editFicha:false, abrirReq:null, verCheck:null, docTab:'doc', openEnt:null, verFicha:false, verResumen:false, verBandaCot:false, horizonte:'mes', calMes:null, calSem:null, verCerradas:false};
 const COLS=[['prio','Prioridad'],['seg','Segmento'],['canal','Estado del canal'],['sc','Sin contacto'],
   ['nq','Cotizaciones'],['vivo','Monto vivo'],['tar','Tareas'],['prox','Próximo paso'],['acc','Acciones']];
 
@@ -829,6 +829,7 @@ function migrar(st){
     if(!q.incidencias)q.incidencias=[];
     if(!q.revalidaciones)q.revalidaciones=[];
     if(!q.despachos)q.despachos=[];
+    if(!q.entregas)migrarDespachos(q);
     if(q.pedido===undefined)q.pedido='';
     if(!q.monday)q.monday={url:'',fabrica:'',semana:'',nota:''};
     if(!q.hitos.coord)q.hitos.coord='';
@@ -1240,8 +1241,9 @@ async function revalidar(q){
    ============================================================ */
 function kgLinea(l){ return Number(l.kg)||0; }
 function kgTotalCot(q){ return (q.lineas||[]).reduce((a,l)=>a+kgLinea(l),0)||Number(q.kg)||0; }
-function kgDespachados(q){ return (q.despachos||[]).filter(d=>d.estado!=='anulado')
-  .reduce((a,d)=>a+(Number(d.kg)||0),0); }
+function kgDespachados(q){
+  if(q.entregas&&q.entregas.length){ try{ return saldoCot(q).despachado; }catch(e){} }
+  return (q.despachos||[]).filter(d=>d.estado!=='anulado').reduce((a,d)=>a+(Number(d.kg)||0),0); }
 function kgPorLinea(q){
   const m={};
   (q.lineas||[]).forEach(l=>{ m[l.id]={producto:l.producto||l.familia,total:kgLinea(l),salido:0}; });
@@ -1721,10 +1723,17 @@ function xlsxBlob(){
   hoja('LINEAS',[['Folio',l=>l.folio],['Cuenta',l=>l.cuenta],['Familia',l=>l.familia],['Descripción',l=>l.producto],
     ['kg',l=>l.kg||''],['$/kg',l=>l.precioKg||''],['Monto fijo',l=>l.monto||''],
     ['Total',l=>Math.round((Number(l.kg)||0)*(Number(l.precioKg)||0)+(Number(l.monto)||0))]],lin);
-  const dsp=[]; S.cotizaciones.forEach(q=>(q.despachos||[]).forEach(x=>dsp.push({...x,folio:q.folio,cuenta:q.cuenta,oc:q.oc,pedido:q.pedido})));
-  hoja('DESPACHOS',[['Folio',x=>x.folio],['Cuenta',x=>x.cuenta],['OC',x=>x.oc||''],['Pedido',x=>x.pedido||''],
-    ['Fecha',x=>x.fecha],['Guía',x=>x.guia],['kg',x=>x.kg],['Transporte',x=>x.transporte],
-    ['Estado',x=>x.estado],['Nota',x=>x.nota]],dsp);
+  const ent=[]; S.cotizaciones.forEach(q=>(q.entregas||[]).forEach(e=>{
+    const w=(()=>{try{return quienTiene(e);}catch(x){return null;}})();
+    ent.push({q,e,w});}));
+  hoja('ENTREGAS',[['Folio',x=>x.q.folio],['Cuenta',x=>x.q.cuenta],['OC',x=>x.q.oc||''],
+    ['Entrega',x=>x.e.n],['kg',x=>x.e.kg],['Modalidad',x=>x.e.modalidad],
+    ['Pedido SAP',x=>x.e.pedidoSap||''],['Monday',x=>x.e.monday||''],['Guía',x=>x.e.guia||''],
+    ['Pidió',x=>x.e.solicitada||''],['Comprometida',x=>x.e.comprometida||''],['Real',x=>x.e.real||''],
+    ['Etapa actual',x=>x.w?x.w.etapa.t:'completa'],['Responsable',x=>x.w?x.w.resp:''],
+    ['Horas',x=>x.w&&x.w.horas!==null?x.w.horas:''],['SLA',x=>x.w?x.w.sla:''],
+    ['Bloqueada',x=>{try{return bloqueada(x.e)?'sí':'';}catch(y){return '';}}],
+    ['Resultado',x=>x.e.resultado||''],['Anulada',x=>x.e.anulada?'sí':'']],ent);
   const rvl=[]; S.cotizaciones.forEach(q=>(q.revalidaciones||[]).forEach(x=>rvl.push({...x,folio:q.folio,cuenta:q.cuenta})));
   hoja('REVALIDACIONES',[['Folio',x=>x.folio],['Cuenta',x=>x.cuenta],['Fecha',x=>x.ts],
     ['Vencía',x=>x.desde],['Nueva validez',x=>x.hasta],['Motivo',x=>x.motivo],['Detalle',x=>x.nota]],rvl);
@@ -1746,6 +1755,628 @@ function descargarRespaldo(){
   const b=xlsxBlob(); if(!b){toast('El lector de Excel no cargó');return;}
   const a=el('a',{href:URL.createObjectURL(b),download:'cartera_acma_'+iso(HOY)+'.xlsx'});
   document.body.append(a);a.click();a.remove();toast('Descargado');
+}
+
+/* ============================================================
+   ENTREGAS PARCIALES
+   La unidad de seguimiento no es la orden de compra: es cada entrega.
+   Una sola OC genera N parciales impredecibles porque el cliente pide
+   por llamada, y cada una recorre su propio circuito con responsables
+   distintos. Seguir la OC como un bloque esconde justo lo que se cae.
+   ============================================================ */
+const ETAPAS_E=[
+  {k:'E1',t:'Enviada a coordinación',resp:'Benjamín Bittelman',sla:24,omitible:false,
+   cierra:'Correo a Diego con los cinco datos completos'},
+  {k:'E2',t:'Pedido ingresado en SAP',resp:'Diego Tapia',sla:24,omitible:false,
+   cierra:'Llega el número de pedido'},
+  {k:'E3',t:'Cargado en Monday',resp:'Sergio Madrid',sla:24,omitible:true,
+   cierra:'Item de producción creado',omiteSi:'hay stock'},
+  {k:'E4',t:'Carga programada',resp:'Coordinación',sla:0,omitible:true,
+   cierra:'Fecha y camiones confirmados',omiteSi:'lo retira el cliente'},
+  {k:'E5',t:'Guía emitida',resp:'Martín Moreno',sla:0,omitible:false,
+   cierra:'Número de guía registrado'},
+  {k:'E6',t:'Despachado o retirado',resp:'Coordinación',sla:0,omitible:false,
+   cierra:'Fecha real registrada'},
+  {k:'E7',t:'Recepción conforme',resp:'Benjamín Bittelman',sla:24,omitible:false,
+   cierra:'Confirmación del cliente'}];
+const ETAPA=k=>ETAPAS_E.find(x=>x.k===k);
+const RESULTADOS=['conforme','conforme con observación','rechazo parcial','rechazo total'];
+const TIPOS_BLOQUEO=['crédito o cobranza','falta un dato del cliente','sin stock','producción','otro'];
+const MOTIVOS_RECHAZO=['Oxidación superficial','Diferencia de cubicación',
+  'Producto no conforme a plano','Daño en transporte','Entrega fuera de plazo','Otro'];
+
+function etapaNueva(k){
+  const e=ETAPA(k);
+  return {estado:'pendiente',responsable:e.resp,sla:e.sla,inicio:'',cumplida:'',
+    evidencia:[],nota:'',override:null,resultado:''};
+}
+function entregaNueva(q,n){
+  const et={};
+  ETAPAS_E.forEach(e=>et[e.k]=etapaNueva(e.k));
+  et.E1.inicio=new Date().toISOString();
+  et.E1.estado='en_curso';
+  return {id:uid(),n,modalidad:'despacho',kg:0,lineas:[],
+    direccion:q.ingreso?.direccion||'',
+    solicitada:'',comprometida:'',real:'',
+    produccion:null,pedidoSap:q.pedido||'',monday:'',guia:'',
+    camiones:[],etapas:et,bloqueos:[],incidencias:[],historial:[],
+    resultado:'',anulada:false};
+}
+/* ---------- relojes y SLA ---------- */
+const horas=(a,b)=>{const x=new Date(a),y=b?new Date(b):new Date();
+  return isNaN(x)?null:Math.max(0,Math.round((y-x)/36e5));};
+const bloqueada=en=>(en.bloqueos||[]).some(b=>!b.cierre);
+function horasBloqueado(en,desde){
+  return (en.bloqueos||[]).reduce((a,b)=>{
+    const i=new Date(b.apertura), f=b.cierre?new Date(b.cierre):new Date();
+    const d0=desde?new Date(desde):i;
+    const ini=i>d0?i:d0;
+    return f>ini?a+Math.round((f-ini)/36e5):a;},0);
+}
+function relojEtapa(en,k){
+  const e=en.etapas[k];
+  if(!e||!e.inicio||e.estado==='cumplida'||e.estado==='omitida')return null;
+  const t=horas(e.inicio);
+  const cong=horasBloqueado(en,e.inicio);
+  return {horas:Math.max(0,t-cong),congeladas:cong,sla:e.sla||0};
+}
+function semaforo(en,k){
+  const e=en.etapas[k];
+  if(!e)return 'g';
+  if(bloqueada(en))return 'blq';
+  if(e.estado==='cumplida')return 'ok';
+  if(e.estado==='cumplida_fuera_sla')return 'tarde';
+  if(e.estado==='omitida')return 'omit';
+  const r=relojEtapa(en,k);
+  if(!r||!r.sla)return 'curso';
+  if(r.horas>r.sla)return 'venc';
+  if(r.horas>r.sla*0.7)return 'ojo';
+  return 'curso';
+}
+function etapaActual(en){
+  for(const e of ETAPAS_E){
+    const x=en.etapas[e.k];
+    if(!x)continue;
+    if(x.estado==='pendiente'||x.estado==='en_curso'||x.estado==='bloqueada')return e.k;
+  }
+  return null;
+}
+function quienTiene(en){
+  const k=etapaActual(en);
+  if(!k)return null;
+  const e=en.etapas[k], r=relojEtapa(en,k), s=semaforo(en,k);
+  return {k,etapa:ETAPA(k),resp:e.responsable||ETAPA(k).resp,horas:r?r.horas:null,
+    sla:e.sla||0,sem:s,bloqueada:bloqueada(en)};
+}
+/* incoherencias: etapas cerradas dejando anteriores abiertas */
+function inconsistencias(en){
+  const out=[];
+  ETAPAS_E.forEach((e,i)=>{
+    const x=en.etapas[e.k];
+    if(!x||!['cumplida','cumplida_fuera_sla'].includes(x.estado))return;
+    ETAPAS_E.slice(0,i).forEach(p=>{
+      const y=en.etapas[p.k];
+      if(y&&['pendiente','en_curso'].includes(y.estado))
+        out.push(e.t+' cerrada sin '+p.t.toLowerCase());
+    });
+  });
+  return [...new Set(out)];
+}
+/* ---------- saldo por cotización ---------- */
+function saldoCot(q){
+  const total=kgTotalCot(q);
+  const ent=(q.entregas||[]).filter(e=>!e.anulada);
+  const despachado=ent.filter(e=>['cumplida','cumplida_fuera_sla'].includes(e.etapas?.E6?.estado))
+    .reduce((a,e)=>a+(Number(e.kg)||0),0);
+  const rechazado=ent.reduce((a,e)=>a+(e.kgRechazados||0),0);
+  const comprometido=ent.filter(e=>!['cumplida','cumplida_fuera_sla'].includes(e.etapas?.E6?.estado))
+    .reduce((a,e)=>a+(Number(e.kg)||0),0);
+  const neto=Math.max(0,despachado-rechazado);
+  return {total,despachado:neto,comprometido,
+    pendiente:Math.max(0,total-neto-comprometido),
+    pct:total?Math.min(100,Math.round(neto/total*100)):0,
+    sobre:Math.max(0,neto+comprometido-total)};
+}
+const entregasDe=q=>(q.entregas||[]).filter(e=>!e.anulada);
+function todasLasEntregas(){
+  const out=[];
+  S.cotizaciones.forEach(q=>(q.entregas||[]).forEach(e=>{ if(!e.anulada)out.push({q,e}); }));
+  return out;
+}
+/* costo de no insistir: qué tan caro sale que esto siga detenido */
+function prioridadEntrega(q,en){
+  const w=quienTiene(en);
+  if(!w)return 0;
+  const r=relojEtapa(en,w.k);
+  const atraso=r&&r.sla?Math.max(0,r.horas-r.sla):(r?r.horas/24:0);
+  const dcomp=en.comprometida?dias(en.comprometida):null;
+  const urg=dcomp===null?0:(dcomp<0?60+Math.abs(dcomp)*4:Math.max(0,30-dcomp*2));
+  const peso=Math.log10(Math.max(100,Number(en.kg)||0))*8;
+  return Math.round(atraso*1.5+urg+peso+(bloqueada(en)?25:0));
+}
+
+/* ---------- transiciones ---------- */
+function logE(en,q,campo,antes,ahora,origen){
+  en.historial=en.historial||[];
+  en.historial.unshift({ts:new Date().toISOString(),campo,antes:String(antes??''),
+    ahora:String(ahora??''),origen:origen||'manual'});
+}
+function arrancaSiguiente(en,k){
+  const i=ETAPAS_E.findIndex(x=>x.k===k);
+  for(let j=i+1;j<ETAPAS_E.length;j++){
+    const s=en.etapas[ETAPAS_E[j].k];
+    if(s&&s.estado==='pendiente'){ s.estado='en_curso'; s.inicio=new Date().toISOString(); return; }
+    if(s&&s.estado!=='omitida')return;
+  }
+}
+async function cerrarEtapa(q,en,k,origen){
+  const e=en.etapas[k], def=ETAPA(k);
+  if(k==='E1'){
+    const f=faltaIngreso(q);
+    if(f.length&&!e.override){
+      const r=await ask('Coordinación no acepta este ingreso',[
+        {k:'x',label:'Faltan '+f.length+' de los seis datos',type:'textarea',
+         value:f.map(y=>'• '+y.t+' — '+y.a).join('\n')},
+        {k:'forzar',label:'¿Cerrarla igual?',type:'select',options:['No, voy a completarlos','Sí, forzar el cierre'],value:'No, voy a completarlos'},
+        {k:'motivo',label:'Si fuerzas, por qué',type:'textarea'}],'Continuar');
+      if(!r||r.forzar.startsWith('No')){ UI.abrirReq=q.qid; render(); return; }
+      e.override={por:'Benjamín',motivo:r.motivo||'sin motivo',ts:iso(HOY)};
+    }
+  }
+  if(k==='E7'){ return cerrarRecepcion(q,en); }
+  const extra={E2:['pedidoSap','N° de pedido en SAP'],E3:['monday','Item de Monday'],
+    E5:['guia','N° de guía de despacho'],E6:['real','Fecha real de salida']}[k];
+  let val=null;
+  if(extra){
+    const r=await ask(def.t,[{k:'v',label:extra[1],
+      type:extra[0]==='real'?'date':'text',value:extra[0]==='real'?iso(HOY):(en[extra[0]]||'')}],'Cerrar etapa');
+    if(!r)return; val=r.v;
+  }
+  mut('cerrar '+k,()=>{
+    if(extra&&val){ logE(en,q,extra[0],en[extra[0]],val,origen); en[extra[0]]=val; }
+    const r=relojEtapa(en,k);
+    const tarde=r&&r.sla&&r.horas>r.sla;
+    e.estado=tarde?'cumplida_fuera_sla':'cumplida';
+    e.cumplida=new Date().toISOString();
+    logE(en,q,'etapa '+k,'abierta',e.estado,origen);
+    arrancaSiguiente(en,k);
+    sincronizarEjecucion(q);
+    logB(q.cuenta,'ejecucion','['+q.folio+' · entrega '+en.n+'] '+def.t+' cerrada'+
+      (tarde?' fuera del SLA ('+r.horas+' h sobre '+r.sla+')':'')+(val?' · '+val:''));
+  });
+  if(['E5','E6'].includes(k))proponerCerrarAnteriores(q,en,k);
+}
+async function proponerCerrarAnteriores(q,en,k){
+  const i=ETAPAS_E.findIndex(x=>x.k===k);
+  const abiertas=ETAPAS_E.slice(0,i).filter(p=>['pendiente','en_curso'].includes(en.etapas[p.k]?.estado));
+  if(!abiertas.length)return;
+  if(!await confirmar('Cerraste '+ETAPA(k).t+' con '+abiertas.length+
+    ' etapa(s) anterior(es) abierta(s): '+abiertas.map(x=>x.t).join(', ')+
+    '. ¿Las doy por cumplidas también?','Cerrarlas'))return;
+  mut('cerrar anteriores',()=>{
+    abiertas.forEach(p=>{const y=en.etapas[p.k];
+      y.estado='cumplida'; y.cumplida=new Date().toISOString();
+      y.nota=(y.nota?y.nota+' · ':'')+'cerrada en bloque al registrar '+ETAPA(k).t;
+      logE(en,q,'etapa '+p.k,'abierta','cumplida','automatico');});
+    sincronizarEjecucion(q);
+  });
+}
+async function omitirEtapa(q,en,k){
+  const def=ETAPA(k);
+  const r=await ask('Omitir '+def.t,[
+    {k:'motivo',label:'Por qué se omite',type:'select',
+     options:[def.omiteSi||'no aplica','hay stock disponible','lo retira el cliente','otro'],
+     value:def.omiteSi||'no aplica'},
+    {k:'nota',label:'Detalle',type:'textarea'}],'Omitir');
+  if(!r)return;
+  mut('omitir '+k,()=>{
+    const e=en.etapas[k];
+    e.estado='omitida'; e.nota=r.motivo+(r.nota?' · '+r.nota:''); e.cumplida=new Date().toISOString();
+    if(k==='E3')en.produccion=false;
+    if(k==='E4')en.modalidad='retiro';
+    logE(en,q,'etapa '+k,'abierta','omitida','manual');
+    arrancaSiguiente(en,k);
+    sincronizarEjecucion(q);
+  });
+}
+async function reabrirEtapa(q,en,k){
+  mut('reabrir '+k,()=>{
+    const e=en.etapas[k];
+    logE(en,q,'etapa '+k,e.estado,'en_curso','manual');
+    e.estado='en_curso'; e.cumplida=''; e.override=null;
+    if(!e.inicio)e.inicio=new Date().toISOString();
+    sincronizarEjecucion(q);
+  });
+}
+async function bloquearEntrega(q,en){
+  const r=await ask('Bloquear la entrega '+en.n,[
+    {k:'tipo',label:'Tipo de bloqueo',type:'select',options:TIPOS_BLOQUEO,value:TIPOS_BLOQUEO[0]},
+    {k:'desc',label:'Qué pasa',type:'textarea'},
+    {k:'quien',label:'Quién lo libera'}],'Bloquear');
+  if(!r)return;
+  mut('bloquear entrega',()=>{
+    en.bloqueos=en.bloqueos||[];
+    en.bloqueos.unshift({id:uid(),tipo:r.tipo,desc:r.desc||'',apertura:new Date().toISOString(),
+      cierre:null,quien:r.quien||''});
+    logE(en,q,'bloqueo','','abierto: '+r.tipo,'manual');
+    logB(q.cuenta,'ejecucion','['+q.folio+' · entrega '+en.n+'] BLOQUEADA por '+r.tipo+
+      (r.desc?': '+r.desc:'')+'. El reloj de SLA queda congelado.');
+    nuevaTarea(q.cuenta,'Destrabar la entrega '+en.n+' de '+q.folio+' — '+r.tipo,iso(HOY),'mio',q.folio);
+  });
+  toast('Bloqueada. El reloj de SLA queda congelado mientras dure.');
+}
+function liberarBloqueo(q,en,b){
+  mut('liberar bloqueo',()=>{
+    b.cierre=new Date().toISOString();
+    logE(en,q,'bloqueo','abierto','liberado','manual');
+    logB(q.cuenta,'ejecucion','['+q.folio+' · entrega '+en.n+'] bloqueo liberado tras '+
+      horas(b.apertura,b.cierre)+' h.');
+  });
+}
+async function cerrarRecepcion(q,en){
+  const r=await ask('Recepción de la entrega '+en.n,[
+    {k:'res',label:'Cómo la recibió el cliente',type:'select',options:RESULTADOS,value:'conforme'},
+    {k:'motivo',label:'Si hubo problema, cuál',type:'select',options:['—',...MOTIVOS_RECHAZO],value:'—'},
+    {k:'kg',label:'Kilos afectados',type:'number',value:''},
+    {k:'accion',label:'Qué se hizo',type:'textarea'}],'Registrar');
+  if(!r)return;
+  mut('recepción',()=>{
+    const e=en.etapas.E7;
+    const rel=relojEtapa(en,'E7');
+    e.estado=(rel&&rel.sla&&rel.horas>rel.sla)?'cumplida_fuera_sla':'cumplida';
+    e.cumplida=new Date().toISOString(); e.resultado=r.res;
+    en.resultado=r.res;
+    const kgAf=Number(r.kg)||0;
+    if(r.res!=='conforme'){
+      en.incidencias=en.incidencias||[];
+      en.incidencias.unshift({id:uid(),fecha:iso(HOY),tipo:r.motivo==='—'?r.res:r.motivo,
+        detalle:r.accion||'',kg:kgAf,resuelto:false,resueltoTs:'',cierre:''});
+      /* los kilos rechazados vuelven al saldo por despachar */
+      if(/rechazo/.test(r.res)&&kgAf){ en.kgRechazados=(en.kgRechazados||0)+kgAf;
+        nuevaTarea(q.cuenta,'Reponer '+num(kgAf)+' kg rechazados de la entrega '+en.n+' de '+q.folio,
+          iso(HOY),'mio',q.folio); }
+      q.incidencias=q.incidencias||[];
+      q.incidencias.unshift({id:uid(),fecha:iso(HOY),tipo:(r.motivo==='—'?r.res:r.motivo)+
+        ' · entrega '+en.n,detalle:r.accion||'',resuelto:false,resueltoTs:'',cierre:''});
+    }
+    logE(en,q,'recepción','',r.res,'manual');
+    logB(q.cuenta,'ejecucion','['+q.folio+' · entrega '+en.n+'] recepción '+r.res+
+      (kgAf?' · '+num(kgAf)+' kg afectados':'')+(r.accion?'. '+r.accion:''));
+    sincronizarEjecucion(q);
+  });
+  toast(r.res==='conforme'?'Entrega cerrada conforme':'Registrado. Los kilos rechazados vuelven al saldo.');
+}
+/* la etapa de ejecución de la cotización se deduce de sus entregas */
+function sincronizarEjecucion(q){
+  const es=entregasDe(q);
+  if(!es.length)return;
+  const cerr=k=>es.every(e=>['cumplida','cumplida_fuera_sla','omitida'].includes(e.etapas[k]?.estado));
+  const alg=k=>es.some(e=>['cumplida','cumplida_fuera_sla'].includes(e.etapas[k]?.estado));
+  const s=saldoCot(q);
+  let et=q.ejecucion||'OC recibida';
+  if(alg('E1'))et='En coordinación';
+  if(alg('E2'))et='Pedido ingresado';
+  if(alg('E3'))et='Programada en fábrica';
+  if(alg('E6'))et='En despacho';
+  if(s.pct>=100&&cerr('E6'))et='Entregada';
+  if(q.hitos?.factura)et='Facturada';
+  if(q.ejecucion!=='Cerrada')q.ejecucion=et;
+  const h={E1:'coord',E2:'ingreso',E3:'programa',E6:'despacho',E7:'entrega'};
+  Object.entries(h).forEach(([k,hh])=>{
+    if(!q.hitos[hh]&&alg(k)){
+      const e=es.map(x=>x.etapas[k]).filter(x=>x&&x.cumplida).sort((a,b)=>a.cumplida.localeCompare(b.cumplida))[0];
+      if(e)q.hitos[hh]=String(e.cumplida).slice(0,10);
+    }
+  });
+}
+async function crearEntrega(q){
+  const s=saldoCot(q);
+  const r=await ask('Nueva entrega parcial de '+folioRev(q),[
+    {k:'kg',label:'Kilos de esta entrega (quedan '+num(s.pendiente)+' de '+num(s.total)+')',
+     type:'number',value:s.pendiente||''},
+    {k:'modalidad',label:'Modalidad',type:'select',options:['despacho','retiro'],value:'despacho'},
+    {k:'solicitada',label:'Fecha que pidió el cliente',type:'date',value:''},
+    {k:'comprometida',label:'Fecha que le confirmamos',type:'date',value:''},
+    {k:'direccion',label:'Dirección de entrega',value:q.ingreso?.direccion||''},
+    {k:'produccion',label:'¿Hay que producir?',type:'select',
+     options:['No lo sé todavía','Sí, va a producción','No, hay stock'],value:'No lo sé todavía'}],'Crear entrega');
+  if(!r)return;
+  const kg=Number(r.kg)||0;
+  if(kg>s.pendiente+1&&!await confirmar('Estás comprometiendo '+num(kg)+' kg y solo quedan '+
+    num(s.pendiente)+' del saldo de la OC. Se va a marcar como sobreconsumo.','Crear igual'))return;
+  mut('nueva entrega',()=>{
+    q.entregas=q.entregas||[];
+    const en=entregaNueva(q,(q.entregas.length||0)+1);
+    en.kg=kg; en.modalidad=r.modalidad; en.solicitada=r.solicitada; en.comprometida=r.comprometida;
+    en.direccion=r.direccion;
+    if(r.produccion.startsWith('No,')){ en.produccion=false;
+      en.etapas.E3.estado='omitida'; en.etapas.E3.nota='hay stock disponible'; }
+    if(r.produccion.startsWith('Sí'))en.produccion=true;
+    if(r.modalidad==='retiro'){ en.etapas.E4.estado='omitida'; en.etapas.E4.nota='lo retira el cliente'; }
+    q.entregas.push(en);
+    logE(en,q,'entrega','','creada con '+num(kg)+' kg','manual');
+    logB(q.cuenta,'ejecucion','['+q.folio+'] entrega parcial '+en.n+' por '+num(kg)+' kg'+
+      (r.comprometida?', comprometida para el '+fdate(r.comprometida):'')+'.');
+  });
+  toast('Entrega '+((q.entregas||[]).length)+' creada. El reloj de E1 ya está corriendo.');
+}
+async function anularEntrega(q,en){
+  const r=await ask('Anular la entrega '+en.n,[
+    {k:'motivo',label:'Por qué se anula',type:'textarea',
+     ph:'reprogramada, el cliente la canceló, se dividió en dos…'}],'Anular');
+  if(!r)return;
+  mut('anular entrega',()=>{ en.anulada=true; en.motivoAnulacion=r.motivo||'';
+    logE(en,q,'entrega','activa','anulada','manual');
+    logB(q.cuenta,'ejecucion','['+q.folio+'] entrega '+en.n+' anulada. '+(r.motivo||''));
+    sincronizarEjecucion(q); });
+}
+/* migración de los despachos planos anteriores */
+function migrarDespachos(q){
+  if(q.entregas)return;
+  q.entregas=[];
+  (q.despachos||[]).forEach((d,i)=>{
+    const en=entregaNueva(q,i+1);
+    en.kg=Number(d.kg)||0; en.guia=d.guia||''; en.real=d.fecha||''; en.comprometida=d.fecha||'';
+    en.camiones=d.transporte?[{tipo:d.transporte,patente:'',valor:0}]:[];
+    en.anulada=d.estado==='anulado';
+    ['E1','E2','E3','E4','E5','E6'].forEach(k=>{
+      en.etapas[k].estado='cumplida'; en.etapas[k].cumplida=(d.fecha||iso(HOY))+'T12:00:00Z';
+      en.etapas[k].nota='migrada del registro anterior de despachos'; });
+    en.etapas.E7.estado=d.estado==='recibido conforme'?'cumplida':'en_curso';
+    en.etapas.E7.inicio=(d.fecha||iso(HOY))+'T12:00:00Z';
+    if(d.estado==='recibido conforme'){ en.etapas.E7.cumplida=en.etapas.E7.inicio; en.resultado='conforme'; }
+    if(d.nota)en.etapas.E6.nota=d.nota;
+    q.entregas.push(en);
+  });
+}
+
+/* ============================================================
+   INTERFAZ DE ENTREGAS
+   ============================================================ */
+const SEM={ok:['v','en plazo'],tarde:['m','fuera de SLA'],curso:['a','en curso'],
+  ojo:['m','por vencer'],venc:['r','SLA vencido'],blq:['r','bloqueada'],omit:['g','omitida'],g:['g','—']};
+
+function pistaEtapas(q,en){
+  const w=el('div',{class:'via',style:'padding:0'});
+  ETAPAS_E.forEach(def=>{
+    const e=en.etapas[def.k], s=semaforo(en,def.k), r=relojEtapa(en,def.k);
+    const cls='h '+(['cumplida','cumplida_fuera_sla'].includes(e.estado)?'ok'
+      :e.estado==='omitida'?'':(etapaActual(en)===def.k?(s==='venc'||s==='blq'?'malo':'aqui'):''));
+    const n=el('div',{class:cls});
+    n.append(el('div',{class:'ln',style:e.estado==='omitida'?'background:var(--linea);opacity:.5':''}),
+      el('button',{title:def.t+' · '+def.resp+(def.sla?' · SLA '+def.sla+' h':'')+
+          (e.nota?'\n'+e.nota:'')+(e.override?'\nForzada: '+e.override.motivo:''),
+        onclick:ev=>{ev.stopPropagation();menu(ev.currentTarget,[
+          {titulo:def.k+' · '+def.t,items:[
+            {txt:'Responsable: '+(e.responsable||def.resp),fn:()=>{}},
+            ['cumplida','cumplida_fuera_sla','omitida'].includes(e.estado)
+              ?{txt:'Reabrir esta etapa',fn:()=>reabrirEtapa(q,en,def.k)}
+              :{txt:'Marcar cumplida',fn:()=>cerrarEtapa(q,en,def.k,'manual')},
+            def.omitible&&!['cumplida','omitida'].includes(e.estado)
+              ?{txt:'Omitir',fn:()=>omitirEtapa(q,en,def.k)}:null].filter(Boolean)}]);}},
+        el('div',{class:'nn'},def.k),
+        el('div',{class:'tt'},def.t.replace('Enviada a coordinación','Coordinación')
+          .replace('Pedido ingresado en SAP','SAP').replace('Cargado en Monday','Monday')
+          .replace('Carga programada','Programa').replace('Guía emitida','Guía')
+          .replace('Despachado o retirado','Despacho').replace('Recepción conforme','Recepción')),
+        e.cumplida?el('div',{class:'fh'},fdate(String(e.cumplida).slice(0,10)))
+          :(r&&r.sla?el('div',{class:'fh',style:s==='venc'?'color:var(--mal)':''},r.horas+'/'+r.sla+' h'):null)));
+    w.append(n);
+  });
+  return w;
+}
+
+function filaEntrega(q,en,compacta){
+  const w=quienTiene(en), s=semaforo(en,w?w.k:'E1');
+  const inc=inconsistencias(en);
+  const dcomp=en.comprometida?dias(en.comprometida):null;
+  const cont=el('div',{class:'prod'});
+
+  const idc=el('div',{class:'pid2'});
+  const p=proyecto(q.proyecto);
+  idc.append(el('button',{class:'ob',onclick:()=>{UI.openCot=q.qid;UI.openEnt=en.id;
+      if(q.proyecto)irA({v:'proyecto',id:q.proyecto});else abrir(q.cuenta,'proyectos');}},
+      'Entrega '+en.n+' de '+entregasDe(q).length),
+    el('div',{class:'sb'},q.cuenta),
+    el('div',{class:'sb'},(p?p.nombre:q.obra).slice(0,34)),
+    el('div',{class:'sb'},folioRev(q)+(q.oc?' · OC '+q.oc:'')),
+    el('div',{class:'mto'},num(en.kg)+' kg',
+      en.modalidad==='retiro'?el('span',{class:'mi'},'  retiro'):null));
+  cont.append(idc);
+
+  const mid=el('div',{class:'mid'});
+  mid.append(pistaEtapas(q,en));
+  const meta=el('div',{class:'kgs'});
+  ap(meta,
+    en.pedidoSap?el('span',{},'SAP ',el('b',{},en.pedidoSap)):null,
+    en.monday?el('span',{},'Monday ',el('b',{},en.monday)):null,
+    en.guia?el('span',{},'GD ',el('b',{},en.guia)):null,
+    en.comprometida?el('span',{style:dcomp!==null&&dcomp<0&&!en.real?'color:var(--mal)':''},
+      'comprometida '+fdate(en.comprometida)+(dcomp!==null&&dcomp<0&&!en.real?' · '+Math.abs(dcomp)+'d tarde':'')):null,
+    en.real?el('span',{style:'color:var(--ok)'},'salió '+fdate(en.real)):null,
+    en.resultado?el('span',{style:en.resultado==='conforme'?'color:var(--ok)':'color:var(--mal)'},en.resultado):null);
+  mid.append(meta);
+  if(bloqueada(en)){
+    const b=(en.bloqueos||[]).find(x=>!x.cierre);
+    mid.append(el('div',{style:'margin-top:6px;display:flex;gap:7px;align-items:center;flex-wrap:wrap'},
+      pill('r','bloqueada: '+b.tipo),
+      el('span',{class:'mi'},(b.desc||'')+' · reloj congelado hace '+horas(b.apertura)+' h'),
+      el('button',{class:'b xs',onclick:()=>liberarBloqueo(q,en,b)},'Liberar')));
+  }
+  if(inc.length)mid.append(el('div',{style:'margin-top:6px'},
+    pill('m','fuera de orden: '+inc[0]+(inc.length>1?' y '+(inc.length-1)+' más':''))));
+  cont.append(mid);
+
+  const lat=el('div',{class:'lat2'});
+  if(w){
+    ap(lat,pill(SEM[s][0],w.resp.split(' ')[0]+(w.horas!==null?' · '+w.horas+' h':'')),
+      el('span',{class:'est'},w.etapa.t));
+    if(!bloqueada(en))lat.append(el('button',{class:'b xs pri',onclick:()=>cerrarEtapa(q,en,w.k,'manual')},
+      'Cerrar '+w.k));
+  } else ap(lat,pill('v','completa'));
+  lat.append(el('button',{class:'b xs ico',title:'Más',onclick:e=>menu(e.currentTarget,[
+    {titulo:'Entrega '+en.n,items:[
+      {txt:'Abrir el detalle',fn:()=>{UI.openCot=q.qid;UI.openEnt=en.id;
+        if(q.proyecto)irA({v:'proyecto',id:q.proyecto});else abrir(q.cuenta,'proyectos');}},
+      bloqueada(en)?null:{txt:'Bloquear',fn:()=>bloquearEntrega(q,en)},
+      {txt:'Copiar seguimiento para '+(w?w.resp:'el cliente'),fn:()=>copiarSeguimiento(q,en)},
+      {txt:'Anular esta entrega',fn:()=>anularEntrega(q,en)}].filter(Boolean)}])},'···'));
+  cont.append(lat);
+  return cont;
+}
+function copiarSeguimiento(q,en){
+  const w=quienTiene(en);
+  const p=proyecto(q.proyecto);
+  const t=w?[
+    (w.resp.split(' ')[0])+', buenas tardes.','',
+    'Te consulto por la entrega '+en.n+' de '+q.cuenta+', obra '+(p?p.nombre:q.obra)+'.',
+    'Referencia: '+folioRev(q)+(q.oc?' · OC '+q.oc:'')+(en.pedidoSap?' · pedido '+en.pedidoSap:''),
+    'Son '+num(en.kg)+' kg'+(en.comprometida?', comprometidos con el cliente para el '+fdate(en.comprometida):'')+'.','',
+    'Está pendiente: '+w.etapa.t+', hace '+(w.horas||0)+' horas'+(w.sla?' (el plazo son '+w.sla+' h)':'')+'.',
+    '¿Me confirmas cómo va?','','Gracias,','Benjamín'].join('\n')
+    :'Entrega '+en.n+' de '+q.cuenta+' completa.';
+  navigator.clipboard?.writeText(t).then(()=>toast('Texto copiado'))
+    .catch(()=>ask('Seguimiento',[{k:'t',label:'Cópialo de aquí',type:'textarea',value:t}],'Listo'));
+}
+
+/* ---------- barra de saldo ---------- */
+function barraSaldo(q){
+  const s=saldoCot(q);
+  const w=el('div',{style:'padding:11px var(--s4)'});
+  const b=el('div',{style:'display:flex;height:14px;border-radius:7px;overflow:hidden;background:var(--linea)'});
+  const pct=x=>s.total?Math.max(0,Math.min(100,x/s.total*100)):0;
+  b.append(el('i',{style:'width:'+pct(s.despachado)+'%;background:var(--ok)',title:'despachado'}),
+    el('i',{style:'width:'+pct(s.comprometido)+'%;background:var(--acc2)',title:'comprometido'}));
+  w.append(b,el('div',{class:'kgs',style:'margin-top:7px'},
+    el('span',{},'Cotizado ',el('b',{},num(s.total)+' kg')),
+    el('span',{style:'color:var(--ok)'},'Despachado ',el('b',{style:'color:var(--ok)'},num(s.despachado))),
+    el('span',{style:'color:var(--acc)'},'Comprometido ',el('b',{style:'color:var(--acc)'},num(s.comprometido))),
+    el('span',{},'Por comprometer ',el('b',{},num(s.pendiente))),
+    el('span',{},s.pct+'%')));
+  if(s.sobre)w.append(el('div',{class:'bloqueo',style:'margin:9px 0 0'},'⚠',
+    el('div',{},'Sobreconsumo de la OC: hay '+num(s.sobre)+' kg comprometidos por sobre lo cotizado.')));
+  return w;
+}
+
+/* ============================================================
+   QUIÉN TIENE LA PELOTA
+   Lista plana transversal, ordenada por costo de no insistir.
+   Responde en cinco segundos: qué se va a caer y quién la tiene.
+   ============================================================ */
+function tarjetaPelota(limite){
+  const todas=todasLasEntregas()
+    .map(({q,e})=>({q,e,w:quienTiene(e),pr:prioridadEntrega(q,e)}))
+    .filter(x=>x.w).sort((a,b)=>b.pr-a.pr);
+  const venc=todas.filter(x=>x.w.sem==='venc').length;
+  const blq=todas.filter(x=>bloqueada(x.e)).length;
+  const tarde=todas.filter(x=>x.e.comprometida&&!x.e.real&&dias(x.e.comprometida)<0).length;
+  const card=el('div',{class:'c'});
+  ap(card,el('header',{},el('h3',{},'Quién tiene la pelota'),el('span',{class:'co'},String(todas.length)),
+    venc?pill('r',venc+' con SLA vencido'):null,
+    blq?pill('r',blq+' bloqueada'+(blq>1?'s':'')):null,
+    tarde?pill('m',tarde+' fuera de la fecha prometida'):null,
+    el('span',{class:'sp'}),
+    el('span',{class:'mi'},'ordenado por lo que cuesta no insistir')));
+  if(!todas.length){ card.append(vacio(ICO.cotizar,'Nada en curso',
+    'Cuando una cotización adjudicada tenga entregas parciales, cada una aparece acá con su responsable y su reloj.'));
+    return card; }
+  const host=el('div',{class:'tw'});
+  const t=el('table',{class:'tabla'},el('thead',{},el('tr',{},
+    el('th',{class:'fijo'},'Falta'),el('th',{class:'fijo'},'Quién'),el('th',{class:'fijo'},'Hace'),
+    el('th',{class:'fijo'},'Entrega'),el('th',{class:'fijo',style:'text-align:right'},'kg'),
+    el('th',{class:'fijo'},'Comprometida'),el('th',{class:'fijo',style:'width:190px'},''))));
+  const tb=el('tbody');
+  todas.slice(0,limite||40).forEach(({q,e,w})=>{
+    const d=e.comprometida?dias(e.comprometida):null;
+    const p=proyecto(q.proyecto);
+    tb.append(el('tr',{},
+      el('td',{},el('span',{style:'font-weight:600'},w.etapa.t),
+        bloqueada(e)?el('div',{},pill('r','bloqueada')):null),
+      el('td',{},w.resp),
+      el('td',{class:'n'},w.horas!==null?pill(SEM[w.sem][0],w.horas+' h'+(w.sla?' / '+w.sla:'')):''),
+      el('td',{},el('button',{class:'lk',onclick:()=>{UI.openCot=q.qid;UI.openEnt=e.id;
+        if(q.proyecto)irA({v:'proyecto',id:q.proyecto});else abrir(q.cuenta,'proyectos');}},
+        q.cuenta+' · '+(p?p.nombre:q.obra).slice(0,26)),
+        el('div',{class:'mi'},'entrega '+e.n+' · '+folioRev(q))),
+      el('td',{class:'n'},num(e.kg)),
+      el('td',{},d===null?el('span',{class:'mi'},'sin fecha')
+        :pill(d<0?'r':d<=3?'m':'g',d<0?Math.abs(d)+'d tarde':fdate(e.comprometida))),
+      el('td',{},el('button',{class:'b xs',onclick:()=>copiarSeguimiento(q,e)},'Copiar seguimiento'),' ',
+        el('button',{class:'b xs pri',onclick:()=>cerrarEtapa(q,e,w.k,'manual')},'Cerrar'))));
+  });
+  t.append(tb); host.append(t); card.append(host);
+  return card;
+}
+
+/* ---------- bloque de entregas dentro de la cotización ---------- */
+function bloqueEntregas(q){
+  const es=entregasDe(q), s=saldoCot(q);
+  const w=el('div',{style:'border-top:1px solid var(--linea)'});
+  ap(w,el('div',{style:'display:flex;gap:9px;align-items:center;padding:11px var(--s4);flex-wrap:wrap'},
+    el('div',{class:'d4'},'Entregas parciales'),
+    es.length?pill(s.pct>=100?'v':'a',es.length+' · '+s.pct+'%'):null,
+    el('span',{style:'flex:1'}),
+    el('button',{class:'b xs pri',onclick:()=>crearEntrega(q)},'Nueva entrega')));
+  w.append(barraSaldo(q));
+  if(!es.length){ w.append(el('div',{style:'padding:0 var(--s4) var(--s4)'},
+    el('span',{class:'mi'},'El cliente casi nunca pide todo de una vez. Cada llamada pidiendo material es una entrega parcial con su propio circuito.')));
+    return w; }
+  es.forEach(en=>{
+    w.append(filaEntrega(q,en));
+    if(UI.openEnt===en.id)w.append(detalleEntrega(q,en));
+  });
+  return w;
+}
+function detalleEntrega(q,en){
+  const w=el('div',{style:'background:var(--panel2);border-top:2px solid var(--acc);padding:var(--s3) var(--s4)'});
+  const dl=el('dl',{class:'dl',style:'padding:0'}),put=(k,x)=>{dl.append(el('dt',{},k),el('dd',{},x));};
+  put('Kilos',edit(en,'kg',{type:'number',nombre:'kg',fmt:num}));
+  put('Modalidad',edit(en,'modalidad',{options:['despacho','retiro'],nombre:'modalidad'}));
+  put('Dirección',edit(en,'direccion',{nombre:'dirección',blq:true}));
+  put('Pidió el cliente',edit(en,'solicitada',{type:'date',nombre:'fecha',fmt:x=>x?fdate(x):''}));
+  put('Le confirmamos',edit(en,'comprometida',{type:'date',nombre:'fecha',fmt:x=>x?fdate(x):''}));
+  put('Salió el',edit(en,'real',{type:'date',nombre:'fecha',fmt:x=>x?fdate(x):''}));
+  put('Pedido SAP',edit(en,'pedidoSap',{nombre:'pedido',ph:'añadir'}));
+  put('Item de Monday',edit(en,'monday',{nombre:'item',ph:'añadir'}));
+  put('Guía de despacho',edit(en,'guia',{nombre:'guía',ph:'añadir'}));
+  put('Camiones',el('span',{},
+    (en.camiones||[]).map(c=>c.tipo+(c.patente?' · '+c.patente:'')).join(' / ')||el('span',{class:'mi'},'sin registrar'),' ',
+    el('button',{class:'b xs sutil',onclick:async()=>{
+      const r=await ask('Agregar camión',[{k:'tipo',label:'Tipo',value:'rampla'},
+        {k:'patente',label:'Patente'},{k:'valor',label:'Valor del flete',type:'number'}],'Agregar');
+      if(!r)return; mut('camión',()=>{en.camiones=en.camiones||[];
+        en.camiones.push({tipo:r.tipo,patente:r.patente,valor:Number(r.valor)||0});});}},'+ camión')));
+  w.append(dl);
+  const acc=el('div',{class:'adder',style:'margin-top:var(--s3)'});
+  ap(acc,el('button',{class:'b',onclick:()=>bloquearEntrega(q,en)},'Bloquear'),
+    el('button',{class:'b',onclick:()=>copiarSeguimiento(q,en)},'Copiar seguimiento'),
+    el('button',{class:'b',onclick:()=>cerrarRecepcion(q,en)},'Registrar recepción'),
+    el('span',{style:'flex:1'}),
+    el('button',{class:'b sutil',onclick:()=>{UI.openEnt=null;render();}},'Cerrar detalle'),
+    el('button',{class:'b sutil peli',onclick:()=>anularEntrega(q,en)},'Anular'));
+  w.append(acc);
+  if((en.historial||[]).length){
+    const h=el('div',{style:'margin-top:var(--s3)'});
+    h.append(el('div',{class:'mi',style:'margin-bottom:4px'},'Historial'));
+    en.historial.slice(0,12).forEach(x=>h.append(el('div',{class:'mi',style:'font-family:var(--m)'},
+      String(x.ts).slice(0,16).replace('T',' ')+'  ·  '+x.campo+': '+(x.antes||'—')+' → '+x.ahora+'  ·  '+x.origen)));
+    w.append(h);
+  }
+  return w;
+}
+/* ---------- OTIF ---------- */
+function otif(){
+  const porCliente={};
+  todasLasEntregas().forEach(({q,e})=>{
+    if(!e.real||!e.comprometida)return;
+    const c=q.cuenta; porCliente[c]=porCliente[c]||{n:0,ok:0,kg:0,atraso:0};
+    porCliente[c].n++; porCliente[c].kg+=Number(e.kg)||0;
+    const d=Math.round((new Date(e.real)-new Date(e.comprometida))/864e5);
+    if(d<=0)porCliente[c].ok++; else porCliente[c].atraso+=d;
+  });
+  return Object.entries(porCliente).map(([c,x])=>({cliente:c,...x,
+    pct:x.n?Math.round(x.ok/x.n*100):0,atrasoMedio:x.n-x.ok?Math.round(x.atraso/(x.n-x.ok)):0}))
+    .sort((a,b)=>a.pct-b.pct);
 }
 
 /* ============================================================
@@ -2388,7 +3019,11 @@ function tarjetaProduccion(){
       UI.verCerradas?'Ocultar cerrados':'Pedidos cerrados ('+cerradas().length+')')));
   if(!ps.length)card.append(vacio(ICO.cotizar,'Nada en producción',
     'Cuando marques una cotización como adjudicada, el pedido aparece acá y lo puedes seguir hasta el cierre.'));
-  ps.forEach(q=>card.append(filaProduccion(q)));
+  ps.forEach(q=>{
+    const es=entregasDe(q);
+    if(!es.length){ card.append(filaProduccion(q)); return; }
+    es.forEach(en=>card.append(filaEntrega(q,en)));
+  });
   return card;
 }
 function tarjetaCerradas(){
@@ -2827,6 +3462,7 @@ VIEWS.hoy=function(v){
   c2.append(cv,ce,ci);
   g.append(c1,c2); w.append(g);
 
+  w.append(tarjetaPelota(12));
   w.append(tarjetaProduccion());
   if(UI.verCerradas)w.append(tarjetaCerradas());
   w.append(lineaDeVida());
@@ -3746,6 +4382,25 @@ VIEWS.numeros=function(v){
       el('div',{style:'flex:1;min-width:0'},el('div',{class:'d4'},x.t+' — '+x.items.length),
         el('div',{class:'tx2'},x.w),cl)));
   });
+  const ot=otif();
+  if(ot.length){
+    const co=el('div',{class:'c'});
+    co.append(el('header',{},el('h3',{},'OTIF por cliente'),
+      el('span',{class:'mi'},'entregas despachadas dentro de la fecha que le prometiste')));
+    const tw3=el('div',{class:'tw'});
+    const t3=el('table',{class:'tabla'},el('thead',{},el('tr',{},el('th',{class:'fijo'},'Cliente'),
+      el('th',{class:'fijo',style:'text-align:right'},'Entregas'),el('th',{class:'fijo',style:'text-align:right'},'A tiempo'),
+      el('th',{class:'fijo',style:'text-align:right'},'OTIF'),el('th',{class:'fijo',style:'text-align:right'},'Atraso medio'),
+      el('th',{class:'fijo',style:'text-align:right'},'kg'))));
+    const tb3=el('tbody');
+    ot.forEach(x=>tb3.append(el('tr',{},
+      el('td',{},el('button',{class:'lk',onclick:()=>abrir(x.cliente)},x.cliente)),
+      el('td',{class:'n'},String(x.n)),el('td',{class:'n'},String(x.ok)),
+      el('td',{class:'n'},pill(x.pct>=90?'v':x.pct>=70?'m':'r',x.pct+'%')),
+      el('td',{class:'n'},x.atrasoMedio?x.atrasoMedio+' d':'—'),
+      el('td',{class:'n'},num(x.kg)))));
+    t3.append(tb3); tw3.append(t3); co.append(tw3); w.append(co);
+  }
   w.append(salud);
 
   /* ---- estado del archivo documental ---- */
@@ -3934,6 +4589,12 @@ function checks(){
     activas().filter(c=>!c.email).map(c=>c.nombre));
   add('media','Más de 15 días sin contacto','El canal se enfría y hay que reabrirlo desde cero.',
     activas().filter(c=>{const d=sinContacto(c);return d!==null&&d>15;}).map(c=>c.nombre+' ('+sinContacto(c)+'d)'));
+  add('alta','Entregas con el SLA vencido','Alguien lleva más horas de las acordadas con la pelota y el cliente no lo sabe.',
+    (()=>{try{return todasLasEntregas().filter(({e})=>{const w=quienTiene(e);return w&&w.sem==='venc';})
+      .map(({q,e})=>{const w=quienTiene(e);return q.folio+' e'+e.n+' · '+w.resp+' · '+w.horas+'h';});}catch(x){return [];}})());
+  add('alta','Entregas que van a incumplir la fecha prometida','Comprometidas y sin despachar después de la fecha.',
+    (()=>{try{return todasLasEntregas().filter(({e})=>e.comprometida&&!e.real&&dias(e.comprometida)<0)
+      .map(({q,e})=>q.folio+' e'+e.n+' · '+Math.abs(dias(e.comprometida))+'d');}catch(x){return [];}})());
   add('media','Tareas vencidas','La agenda deja de ser confiable en cuanto arrastra vencidos.',
     S.tareas.filter(t=>!t.hecha&&dias(t.fecha)!==null&&dias(t.fecha)<0)
       .map(t=>(esInterna(t)?'interna':t.cuenta)+' ('+Math.abs(dias(t.fecha))+'d)'));
@@ -4322,7 +4983,7 @@ function docCotizacion(q){
   if(tab==='proceso'){
     w.append(via(q));
     if(q.estado==='Adjudicada'){
-      w.append(viaEjecucion(q),bloqueRequisitos(q),bloqueHitos(q),bloqueDespachos(q));
+      w.append(viaEjecucion(q),bloqueRequisitos(q),bloqueEntregas(q),bloqueHitos(q));
     }
     w.append(bloqueIncidencias(q));
     if(q.estado==='Adjudicada')w.append(el('div',{class:'adder'},
@@ -5077,6 +5738,7 @@ function cmdk(){
       {k:'ir a',n:'Cartera',s:'cuentas, proyectos, embudo y personas',go:()=>irA({v:'cartera'})},
       {k:'ir a',n:'Números',s:'gráficos y salud del dato',go:()=>irA({v:'numeros'})},
       {k:'ir a',n:'Bandeja',s:'correos por revisar',go:()=>irA({v:'bandeja'})},
+      {k:'ir a',n:'Quién tiene la pelota',s:'entregas detenidas por responsable',go:()=>irA({v:'hoy'})},
       {k:'ir a',n:'Cotizar',s:'el cotizador ACMA',go:()=>abrirCotizador(cn?{cuenta:cn}:null)},
       {k:'vista',n:'Tabla de cuentas',s:'',go:()=>{UI.vista='tabla';irA({v:'cartera'});}},
       {k:'vista',n:'Malla de la cartera',s:'',go:()=>{UI.vista='malla';irA({v:'cartera'});}},
